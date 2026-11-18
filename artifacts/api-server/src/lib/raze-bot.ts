@@ -1868,7 +1868,7 @@ function applyBotPresence(client: Client<true>) {
     status: "dnd",
     activities: [
       {
-        name: `!help • ${botName()}`,
+        name: "!help • 2k+",
         type: ActivityType.Watching,
       },
     ],

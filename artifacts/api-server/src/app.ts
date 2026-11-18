@@ -29,6 +29,14 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Keep-alive endpoints for Render / UptimeRobot (point the monitor at "/" or "/ping")
+app.get("/", (_req, res) => {
+  res.status(200).send("Bot is online ✅");
+});
+app.get("/ping", (_req, res) => {
+  res.status(200).json({ status: "ok", uptime: Math.round(process.uptime()) });
+});
+
 app.use("/api", router);
 
 export default app;
