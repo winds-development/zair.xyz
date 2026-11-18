@@ -1,0 +1,58 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "XdhtRnw33ErJ_Em2yxVZN"
+uri = "file://raze-discord-bot-updated.zip"
+type = "unspecified"
+title = "Fixed RAZE Discord Bot project"
+description = "Corrected ZIP: RAZE posts the welcome card in the server system channel or first writable text channel, keeps a DM fallback, and attempts a visible goodbye message plus owner DM when removed."
+logical_id = "5544fdcb-5d36-44c2-804f-c87873cddc7f"
+content_hash = "sha256:22b33271d1359f4f8b2f6f41a365bea8c846beec52174a556406559759923050"
+size = 1833662
+mtime_ms = 1790189238454
+storage_uri = "gcs://replit-rams-assets-sisko/rams/assets/repl:9ad52203-bfb6-471d-bc27-36e45f594f09/5544fdcb-5d36-44c2-804f-c87873cddc7f/a08b7267-fd91-4546-9a76-e6ad9315eeff"
+storage_version_token = "1790189246076365"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "im6zZ5nGgkamPhetXDAHE"
+uri = "file://raze-discord-bot-premium-updated.zip"
+type = "unspecified"
+title = "RAZE premium expiry update"
+description = "Updated source ZIP with automatic Premium Expired DMs, timed premium cleanup, Tier 2 owner-mentioned no-prefix perk text, and the existing hidden premium/no-prefix commands."
+logical_id = "512adf7c-a7f2-4ba5-a82e-f502811b3fbb"
+content_hash = "sha256:aa7a92216494907f902d37ed5fd663ba4ba0d58eabd555520de8503b467bbd66"
+size = 1835750
+mtime_ms = 1790191852152
+storage_uri = "gcs://replit-rams-assets-sisko/rams/assets/repl:9ad52203-bfb6-471d-bc27-36e45f594f09/512adf7c-a7f2-4ba5-a82e-f502811b3fbb/afee948d-0208-433c-aae1-3872dd024069"
+storage_version_token = "1790191860767667"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "LQ8mVQz0qlmJ5a1vRINKN"
+uri = "file://raze-discord-bot-welcome-system-updated.zip"
+type = "unspecified"
+title = "RAZE welcome and leave card system"
+description = "Updated source ZIP with !welcomer and !leaver set/remove commands, six rotating anime-style card designs, cards-only member join/leave messages, and Guild Members event handling."
+logical_id = "7998d053-d487-4810-9f64-1ca5a89d853e"
+content_hash = "sha256:a8d4391fd8964a630e37d7c06882e900a211f2534f4fc89d76ef5b1d38efed13"
+size = 1837980
+mtime_ms = 1790239333218
+storage_uri = "gcs://replit-rams-assets-sisko/rams/assets/repl:9ad52203-bfb6-471d-bc27-36e45f594f09/7998d053-d487-4810-9f64-1ca5a89d853e/1f8bb587-098f-4bd7-a328-91c98260191b"
+storage_version_token = "1790239346118167"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "WkyoNfNxSXYjGQ2Kliz_-"
+uri = "file://raze-discord-bot-image-cards-updated.zip"
+type = "unspecified"
+title = "RAZE image-only anime welcome cards"
+description = "Updated source ZIP with 6 generated anime forest welcome images, 6 generated anime forest leave images, image-only Discord cards using attachments, and minimal Welcomer/Leaver Enabled setup cards."
+logical_id = "88556de0-2848-4d74-a9cd-ec03f2ffa018"
+content_hash = "sha256:2df7f1e85a96a9eb5ec43b81b2a3c1ae025b1fe503bda79803f70f92b7372e72"
+size = 23805945
+mtime_ms = 1790239877350
+storage_uri = "gcs://replit-rams-assets-sisko/rams/assets/repl:9ad52203-bfb6-471d-bc27-36e45f594f09/88556de0-2848-4d74-a9cd-ec03f2ffa018/28626fbf-8fe1-41da-b37f-32d65cf9e29e"
+storage_version_token = "1790239889605015"
+content_type = "application/octet-stream"
