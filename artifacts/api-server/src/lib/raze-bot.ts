@@ -29,6 +29,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { logger } from "./logger";
+import {
+  initExtras,
+  isExtraCommand,
+  resolveCommandAlias,
+  respondToExtraCommand,
+  trackMessage,
+} from "./zair-extras";
 
 // Live reference to the running Discord client, so every message uses the
 // bot's CURRENT name (change it in the Discord Developer Portal and it follows).
@@ -421,14 +428,18 @@ const categoryDetails: Record<
       "`!ping` or `!pong` — show the current ping",
       `\`!premium\` — view ${botName()} premium tiers`,
       "",
-      "Only the help command is active right now. Older registered commands were removed.",
+      "Shortcuts: `!h` help • `!st` stats • `!pg` ping • `!prem` premium • `!ut` uptime",
     ],
   },
   server: {
     title: "SERVER CMD",
     lines: [
-      "Server utilities will live here.",
-      "No additional server commands are active yet.",
+      `${whiteDotEmoji} \`!serverinfo\` - (Show server info) • \`!si\``,
+      `${whiteDotEmoji} \`!invites [@user]\` - (How many people a user invited) • \`!inv\``,
+      `${whiteDotEmoji} \`!inviter [@user]\` - (Who invited a user) • \`!ir\``,
+      `${whiteDotEmoji} \`!messages [@user]\` - (Message count and rank) • \`!ms\` \`!msgs\``,
+      `${whiteDotEmoji} \`!resetinvites @user/all\` - (Reset invites, Manage Server) • \`!ri\``,
+      `${whiteDotEmoji} \`!resetmessages @user/all\` - (Reset message counts) • \`!rm\``,
     ],
   },
   security: {
@@ -448,6 +459,8 @@ const categoryDetails: Record<
       `${whiteDotEmoji} \`!unban\` - (unban a user)`,
       `${whiteDotEmoji} \`!unmute\` - (unmute a user)`,
       `${whiteDotEmoji} \`!rape\` - (Rape a sv user)`,
+      "",
+      "Shortcuts: `!am` automod • `!b` ban • `!k` kick • `!mu` mute • `!ub` unban • `!um` unmute",
     ],
   },
   music: {
@@ -466,6 +479,8 @@ const categoryDetails: Record<
       `${whiteDotEmoji} \`!ticket close/reopen\` - (Change ticket status)`,
       `${whiteDotEmoji} \`!ticket claim\` - (Claim a ticket)`,
       `${whiteDotEmoji} \`!ticket transcript\` - (Save a transcript)`,
+      "",
+      "Shortcut: `!tk` ticket",
     ],
   },
   welcome: {
@@ -475,20 +490,36 @@ const categoryDetails: Record<
       `${whiteDotEmoji} \`!welcomer remove\` - (Remove the welcome card channel)`,
       `${whiteDotEmoji} \`!leaver set\` - (Send anime leave cards in this channel)`,
       `${whiteDotEmoji} \`!leaver remove\` - (Remove the leave card channel)`,
+      "",
+      "Shortcuts: `!wc` welcomer • `!lv` leaver",
     ],
   },
   user: {
     title: "USER SYSTEM",
     lines: [
-      "User utilities will live here.",
-      "No additional user commands are active yet.",
+      `${whiteDotEmoji} \`!afk [global/server] [reason]\` - (Set AFK for this server or all servers)`,
+      `${whiteDotEmoji} \`!afk off\` - (Remove your AFK)`,
+      `${whiteDotEmoji} \`!lastping\` - (See who pinged you last) • \`!lp\``,
+    ],
+  },
+  coz: {
+    title: "COZ SYSTEM",
+    lines: [
+      `${whiteDotEmoji} \`!coz [@user]\` - (Check coz balance) • \`!bal\` \`!cash\``,
+      `${whiteDotEmoji} \`!daily\` - (Claim daily coz with streak bonus) • \`!dl\``,
+      `${whiteDotEmoji} \`!give @user <amount>\` - (Send coz to someone) • \`!pay\``,
+      `${whiteDotEmoji} \`!coinflip <amount> [h/t]\` - (Bet on a coin flip) • \`!cf\``,
+      `${whiteDotEmoji} \`!slots <amount>\` - (Spin the slots) • \`!sl\``,
+      `${whiteDotEmoji} \`!cozlb\` - (Server coz leaderboard) • \`!lb\` \`!top\``,
+      `${whiteDotEmoji} \`!resetcoz @user/all\` - (Reset coz, Manage Server) • \`!rc\``,
     ],
   },
   utility: {
     title: "UTILITY",
     lines: [
-      "Utility commands will live here.",
-      "No additional utility commands are active yet.",
+      `${whiteDotEmoji} \`!say <message>\` - (Make the bot say something) • \`!s\``,
+      `${whiteDotEmoji} \`!embed\` - (Build and send an embed) • \`!e\``,
+      `${whiteDotEmoji} \`!dm\` - (Send a DM through the bot) • \`!d\``,
     ],
   },
 };
@@ -547,6 +578,7 @@ function categorySelects(page: number): RawDiscordComponent[] {
       categorySelect("WELCOME SYSTEM", "welcome", "Welcome message commands"),
       categorySelect("USER SYSTEM", "user", "User management commands"),
       categorySelect("UTILITY", "utility", "Utility commands"),
+      categorySelect("COZ SYSTEM", "coz", "Coin economy commands"),
     ],
   ];
 
@@ -4617,10 +4649,12 @@ export async function startRazeBot() {
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildInvites,
     ],
   });
 
   activeClient = client;
+  await initExtras(client);
 
   client.on(Events.Error, (error) => {
     logger.error({ err: error }, "ZAIR Discord client error");
@@ -4875,6 +4909,10 @@ export async function startRazeBot() {
         );
       }
 
+      await trackMessage(message).catch((error) => {
+        logger.warn({ err: error }, "Message tracking failed");
+      });
+
       const botUserId = message.client.user?.id;
       const botMentionPattern = botUserId
         ? new RegExp(`^<@!?${botUserId}>\\s*`)
@@ -4892,8 +4930,15 @@ export async function startRazeBot() {
         .slice(hasPrefix ? prefix.length : 0)
         .trim()
         .split(/\s+/);
-      const normalizedCommand = command?.toLowerCase();
-      if (normalizedCommand === "ap") {
+      const normalizedCommand = resolveCommandAlias(
+        command?.toLowerCase(),
+        hasPrefix,
+      );
+      if (isExtraCommand(normalizedCommand)) {
+        await respondToHelpOnce(message.id, async () =>
+          respondToExtraCommand(message, normalizedCommand as string, args),
+        );
+      } else if (normalizedCommand === "ap") {
         await respondToHelpOnce(message.id, async () =>
           respondToPremiumActivate(message, args),
         );
