@@ -30,8 +30,12 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { logger } from "./logger";
 import {
+  cmdPrefix,
+  flushExtras,
+  getPrefix,
   initExtras,
   isExtraCommand,
+  prefixContext,
   resolveCommandAlias,
   respondToExtraCommand,
   trackMessage,
@@ -40,6 +44,31 @@ import {
 // Live reference to the running Discord client, so every message uses the
 // bot's CURRENT name (change it in the Discord Developer Portal and it follows).
 let activeClient: Client | null = null;
+let botStarted = false;
+let botReady = false;
+
+export function getBotStatus() {
+  const client = activeClient;
+  return {
+    ready: botReady && Boolean(client?.isReady()),
+    user: client?.user?.tag ?? null,
+    guilds: client?.guilds.cache.size ?? 0,
+    pingMs: client && client.ws.ping >= 0 ? Math.round(client.ws.ping) : null,
+  };
+}
+
+export async function stopRazeBot() {
+  botReady = false;
+  flushExtras();
+  if (activeClient) {
+    try {
+      await activeClient.destroy();
+      logger.info("ZAIR Discord client destroyed (graceful shutdown)");
+    } catch (error) {
+      logger.warn({ err: error }, "ZAIR Discord client did not close cleanly");
+    }
+  }
+}
 const fallbackBotName = "ZAIR";
 
 function botName(): string {
@@ -49,7 +78,6 @@ function botName(): string {
 
 const token = process.env["DISCORD_BOT_TOKEN"];
 const execFile = promisify(execFileCallback);
-const prefix = "!";
 const embedColor = 0x2b2d31;
 const redDotEmoji = "<:glowing_dot_red:1549131045876793545>";
 const whiteDotEmoji = "<:glowing_dot_white:1550101471779889176>";
@@ -416,30 +444,43 @@ function helpCommand() {
   };
 }
 
-const categoryDetails: Record<
+function buildCategoryDetails(): Record<
   string,
   { title: string; lines: string[] }
-> = {
+> {
+  return {
   bot: {
     title: "BOT CMD",
     lines: [
       "`/help` — open this Help Centre",
-      "`!help` — open this Help Centre with the prefix",
-      "`!ping` or `!pong` — show the current ping",
-      `\`!premium\` — view ${botName()} premium tiers`,
+      `\`${cmdPrefix()}help\` — open this Help Centre with the prefix`,
+      `\`${cmdPrefix()}ping\` or \`${cmdPrefix()}pong\` — show the current ping`,
+      `\`${cmdPrefix()}premium\` — view ${botName()} premium tiers`,
       "",
-      "Shortcuts: `!h` help • `!st` stats • `!pg` ping • `!prem` premium • `!ut` uptime",
+      `Shortcuts: \`${cmdPrefix()}h\` help • \`${cmdPrefix()}st\` stats • \`${cmdPrefix()}pg\` ping • \`${cmdPrefix()}prem\` premium • \`${cmdPrefix()}ut\` uptime`,
     ],
   },
   server: {
     title: "SERVER CMD",
     lines: [
-      `${whiteDotEmoji} \`!serverinfo\` - (Show server info) • \`!si\``,
-      `${whiteDotEmoji} \`!invites [@user]\` - (How many people a user invited) • \`!inv\``,
-      `${whiteDotEmoji} \`!inviter [@user]\` - (Who invited a user) • \`!ir\``,
-      `${whiteDotEmoji} \`!messages [@user]\` - (Message count and rank) • \`!ms\` \`!msgs\``,
-      `${whiteDotEmoji} \`!resetinvites @user/all\` - (Reset invites, Manage Server) • \`!ri\``,
-      `${whiteDotEmoji} \`!resetmessages @user/all\` - (Reset message counts) • \`!rm\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}serverinfo\` - (Show server info) • \`${cmdPrefix()}si\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}setprefix <new>\` - (Change this server's prefix, Manage Server) • \`${cmdPrefix()}prefix\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}membercount\` - (Total members) • \`${cmdPrefix()}mc\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}roles [@user]\` - (Server roles, or a member's roles) • \`${cmdPrefix()}rl\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}roleinfo @role\` - (Details of a role) • \`${cmdPrefix()}rinfo\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}channelinfo [#channel]\` - (Details of a channel) • \`${cmdPrefix()}ci\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}emojis\` - (List server emojis) • \`${cmdPrefix()}em\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}servericon\` - (Show the server icon) • \`${cmdPrefix()}sicon\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}serverbanner\` - (Show the server banner) • \`${cmdPrefix()}sbanner\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}lock [#channel]\` - (Lock a channel, Manage Channels) • \`${cmdPrefix()}lk\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}unlock [#channel]\` - (Unlock a channel) • \`${cmdPrefix()}ulk\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}slowmode <seconds/off>\` - (Set channel slowmode) • \`${cmdPrefix()}sm\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}nick @user <name/reset>\` - (Change a nickname, Manage Nicknames) • \`${cmdPrefix()}nn\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}invites [@user]\` - (How many people a user invited) • \`${cmdPrefix()}inv\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}inviter [@user]\` - (Who invited a user) • \`${cmdPrefix()}ir\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}messages [@user]\` - (Message count and rank) • \`${cmdPrefix()}ms\` \`${cmdPrefix()}msgs\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}resetinvites @user/all\` - (Reset invites, Manage Server) • \`${cmdPrefix()}ri\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}resetmessages @user/all\` - (Reset message counts) • \`${cmdPrefix()}rm\``,
     ],
   },
   security: {
@@ -452,15 +493,15 @@ const categoryDetails: Record<
   moderation: {
     title: "MOD CMD",
     lines: [
-      `${whiteDotEmoji} \`!automod on/off\` - (Auto moderation for sv)`,
-      `${whiteDotEmoji} \`!ban\` - (Ban a sv user)`,
-      `${whiteDotEmoji} \`!kick\` - (Kick a sv user)`,
-      `${whiteDotEmoji} \`!mute\` - (Muts a sv user)`,
-      `${whiteDotEmoji} \`!unban\` - (unban a user)`,
-      `${whiteDotEmoji} \`!unmute\` - (unmute a user)`,
-      `${whiteDotEmoji} \`!rape\` - (Rape a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}automod on/off\` - (Auto moderation for sv)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ban\` - (Ban a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}kick\` - (Kick a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}mute\` - (Muts a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}unban\` - (unban a user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}unmute\` - (unmute a user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}rape\` - (Rape a sv user)`,
       "",
-      "Shortcuts: `!am` automod • `!b` ban • `!k` kick • `!mu` mute • `!ub` unban • `!um` unmute",
+      `Shortcuts: \`${cmdPrefix()}am\` automod • \`${cmdPrefix()}b\` ban • \`${cmdPrefix()}k\` kick • \`${cmdPrefix()}mu\` mute • \`${cmdPrefix()}ub\` unban • \`${cmdPrefix()}um\` unmute`,
     ],
   },
   music: {
@@ -473,56 +514,79 @@ const categoryDetails: Record<
   ticket: {
     title: "TICKET SYSTEM",
     lines: [
-      `${whiteDotEmoji} \`!ticket setup\` - (Set up the ticket system)`,
-      `${whiteDotEmoji} \`!ticket panel\` - (Send the ticket panel)`,
-      `${whiteDotEmoji} \`!ticket create\` - (Create a ticket)`,
-      `${whiteDotEmoji} \`!ticket close/reopen\` - (Change ticket status)`,
-      `${whiteDotEmoji} \`!ticket claim\` - (Claim a ticket)`,
-      `${whiteDotEmoji} \`!ticket transcript\` - (Save a transcript)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ticket setup\` - (Set up the ticket system)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ticket panel\` - (Send the ticket panel)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ticket create\` - (Create a ticket)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ticket close/reopen\` - (Change ticket status)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ticket claim\` - (Claim a ticket)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ticket transcript\` - (Save a transcript)`,
       "",
-      "Shortcut: `!tk` ticket",
+      `Shortcut: \`${cmdPrefix()}tk\` ticket`,
     ],
   },
   welcome: {
     title: "WELCOME SYSTEM",
     lines: [
-      `${whiteDotEmoji} \`!welcomer set\` - (Send anime welcome cards in this channel)`,
-      `${whiteDotEmoji} \`!welcomer remove\` - (Remove the welcome card channel)`,
-      `${whiteDotEmoji} \`!leaver set\` - (Send anime leave cards in this channel)`,
-      `${whiteDotEmoji} \`!leaver remove\` - (Remove the leave card channel)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}welcomer set\` - (Send anime welcome cards in this channel)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}welcomer remove\` - (Remove the welcome card channel)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}leaver set\` - (Send anime leave cards in this channel)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}leaver remove\` - (Remove the leave card channel)`,
       "",
-      "Shortcuts: `!wc` welcomer • `!lv` leaver",
+      `Shortcuts: \`${cmdPrefix()}wc\` welcomer • \`${cmdPrefix()}lv\` leaver`,
     ],
   },
   user: {
     title: "USER SYSTEM",
     lines: [
-      `${whiteDotEmoji} \`!afk [global/server] [reason]\` - (Set AFK for this server or all servers)`,
-      `${whiteDotEmoji} \`!afk off\` - (Remove your AFK)`,
-      `${whiteDotEmoji} \`!lastping\` - (See who pinged you last) • \`!lp\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}userinfo [@user]\` - (Info about a user) • \`${cmdPrefix()}ui\` \`${cmdPrefix()}whois\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}avatar [@user]\` - (Show an avatar) • \`${cmdPrefix()}av\` \`${cmdPrefix()}pfp\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}banner [@user]\` - (Show a profile banner) • \`${cmdPrefix()}bn\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}afk [global/server] [reason]\` - (Set AFK for this server or all servers)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}afk off\` - (Remove your AFK)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}lastping\` - (See who pinged you last) • \`${cmdPrefix()}lp\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}snipe\` - (Show the last deleted message) • \`${cmdPrefix()}sn\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}editsnipe\` - (Show the last edited message) • \`${cmdPrefix()}es\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}remind <time> <text>\` - (Set a reminder (10m, 2h, 1d)) • \`${cmdPrefix()}rem\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}birthday set DD-MM\` - (Save your birthday, or check someone's) • \`${cmdPrefix()}bd\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}birthdays\` - (Upcoming birthdays in this server) • \`${cmdPrefix()}bds\``,
     ],
   },
   coz: {
     title: "COZ SYSTEM",
     lines: [
-      `${whiteDotEmoji} \`!coz [@user]\` - (Check coz balance) • \`!bal\` \`!cash\``,
-      `${whiteDotEmoji} \`!daily\` - (Claim daily coz with streak bonus) • \`!dl\``,
-      `${whiteDotEmoji} \`!give @user <amount>\` - (Send coz to someone) • \`!pay\``,
-      `${whiteDotEmoji} \`!coinflip <amount> [h/t]\` - (Bet on a coin flip) • \`!cf\``,
-      `${whiteDotEmoji} \`!slots <amount>\` - (Spin the slots) • \`!sl\``,
-      `${whiteDotEmoji} \`!cozlb\` - (Server coz leaderboard) • \`!lb\` \`!top\``,
-      `${whiteDotEmoji} \`!resetcoz @user/all\` - (Reset coz, Manage Server) • \`!rc\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}coz [@user]\` - (Check coz balance) • \`${cmdPrefix()}bal\` \`${cmdPrefix()}cash\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}daily\` - (Claim daily coz with streak bonus) • \`${cmdPrefix()}dl\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}give @user <amount>\` - (Send coz to someone) • \`${cmdPrefix()}pay\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}coinflip <amount> [h/t]\` - (Bet on a coin flip) • \`${cmdPrefix()}cf\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}slots <amount>\` - (Spin the slots) • \`${cmdPrefix()}sl\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}cozlb\` - (Server coz leaderboard) • \`${cmdPrefix()}lb\` \`${cmdPrefix()}top\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}resetcoz @user/all\` - (Reset coz, Manage Server) • \`${cmdPrefix()}rc\``,
     ],
   },
   utility: {
     title: "UTILITY",
     lines: [
-      `${whiteDotEmoji} \`!say <message>\` - (Make the bot say something) • \`!s\``,
-      `${whiteDotEmoji} \`!embed\` - (Build and send an embed) • \`!e\``,
-      `${whiteDotEmoji} \`!dm\` - (Send a DM through the bot) • \`!d\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}ping\` - (Show the bot ping) • \`${cmdPrefix()}pg\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}uptime\` - (Show bot uptime) • \`${cmdPrefix()}ut\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}botinfo\` - (Bot stats and info) • \`${cmdPrefix()}bi\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}invite\` - (Add the bot to your server) • \`${cmdPrefix()}addbot\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}say <message>\` - (Make the bot say something) • \`${cmdPrefix()}s\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}embed\` - (Build and send an embed) • \`${cmdPrefix()}e\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}dm\` - (Send a DM through the bot) • \`${cmdPrefix()}d\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}poll <question> | a | b\` - (Create a poll) • \`${cmdPrefix()}pl\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}calc <expression>\` - (Calculator) • \`${cmdPrefix()}math\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}translate <lang> <text>\` - (Translate text) • \`${cmdPrefix()}tr\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}weather <city>\` - (Current weather) • \`${cmdPrefix()}wt\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}qr <text>\` - (Make a QR code)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}choose a | b | c\` - (Pick one option) • \`${cmdPrefix()}pick\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}8ball <question>\` - (Ask the magic 8ball) • \`${cmdPrefix()}8b\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}flip\` - (Flip a coin) • \`${cmdPrefix()}fl\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}roll [sides / 2d6]\` - (Roll dice) • \`${cmdPrefix()}dice\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}steal <emoji>\` - (Copy a custom emoji, Manage Expressions) • \`${cmdPrefix()}stl\``,
     ],
   },
-};
+  };
+}
 
 function requesterLabel(user: {
   tag?: string;
@@ -658,9 +722,9 @@ function razeAddedWelcomeComponents(
         textComponent(
           [
             "**How to use me:**",
-            "Use `!help` to see all my commands.",
+            `Use \`${cmdPrefix()}help\` to see all my commands.`,
             "Most administrative commands require `Manage Server` or `Administrator` permissions.",
-            "If you need help, use `!help` to see the available commands.",
+            `If you need help, use \`${cmdPrefix()}help\` to see the available commands.`,
           ].join("\n"),
         ),
         separatorComponent(),
@@ -688,7 +752,7 @@ function razeLeftGuildComponents(
         separatorComponent(),
         textComponent(
           [
-            `If this was a mistake, invite ${botName()} again and use \`!help\`.`,
+            `If this was a mistake, invite ${botName()} again and use \`${cmdPrefix()}help\`.`,
             "Thanks for having me.",
           ].join("\n"),
         ),
@@ -960,8 +1024,8 @@ async function respondToMemberEventCommand(
           separatorComponent(),
           textComponent(
             [
-              `\`!${label} set\` — use this channel for anime cards`,
-              `\`!${label} remove\` — disable this card system`,
+              `\`${cmdPrefix()}${label} set\` — use this channel for anime cards`,
+              `\`${cmdPrefix()}${label} remove\` — disable this card system`,
             ].join("\n"),
           ),
         ],
@@ -1447,15 +1511,15 @@ function ticketCustomizationComponents(guildId: string): RawDiscordComponent[] {
         separatorComponent(),
         textComponent(
           [
-            "`!ticket customize heading <text>`",
-            "`!ticket customize center <text>`",
-            "`!ticket customize footer <text>`",
-            "`!ticket customize color <hex>`",
-            "`!ticket customize button <type> <label>`",
-            "`!ticket customize emoji <type> <emoji|none>`",
-            "`!ticket customize style <type> <primary|secondary|success|danger>`",
-            "`!ticket customize toggle <type> <on|off>`",
-            "`!ticket customize reset`",
+            `\`${cmdPrefix()}ticket customize heading <text>\``,
+            `\`${cmdPrefix()}ticket customize center <text>\``,
+            `\`${cmdPrefix()}ticket customize footer <text>\``,
+            `\`${cmdPrefix()}ticket customize color <hex>\``,
+            `\`${cmdPrefix()}ticket customize button <type> <label>\``,
+            `\`${cmdPrefix()}ticket customize emoji <type> <emoji|none>\``,
+            `\`${cmdPrefix()}ticket customize style <type> <primary|secondary|success|danger>\``,
+            `\`${cmdPrefix()}ticket customize toggle <type> <on|off>\``,
+            `\`${cmdPrefix()}ticket customize reset\``,
           ].join("\n"),
         ),
       ],
@@ -1626,15 +1690,15 @@ function botCategoryComponents(
 ): RawDiscordComponent[] {
   const pages = [
     [
-      `${whiteDotEmoji} \`!stats\` - (It will show the stats of ${botName()})`,
-      `${whiteDotEmoji} \`!uptime\` - (Show the current uptime of bot)`,
-      `${whiteDotEmoji} \`!ping\` and \`!pong\` - (Show current bot ping)`,
-      `${whiteDotEmoji} \`!premium\` - (View ${botName()} premium tiers)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}stats\` - (It will show the stats of ${botName()})`,
+      `${whiteDotEmoji} \`${cmdPrefix()}uptime\` - (Show the current uptime of bot)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ping\` and \`${cmdPrefix()}pong\` - (Show current bot ping)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}premium\` - (View ${botName()} premium tiers)`,
     ],
     [
-      `${whiteDotEmoji} \`!say\` - (Say something by bot)`,
-      `${whiteDotEmoji} \`!embed\` - (View the embed guide)`,
-      `${whiteDotEmoji} \`!dm\` - (Dm a particular user by bot)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}say\` - (Say something by bot)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}embed\` - (View the embed guide)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}dm\` - (Dm a particular user by bot)`,
     ],
   ];
   const safePage = Math.max(0, Math.min(page, pages.length - 1));
@@ -1665,15 +1729,15 @@ function moderationCategoryComponents(
 ): RawDiscordComponent[] {
   const pages = [
     [
-      `${whiteDotEmoji} \`!automod on/off\` - (Auto moderation for sv)`,
-      `${whiteDotEmoji} \`!ban\` - (Ban a sv user)`,
-      `${whiteDotEmoji} \`!kick\` - (Kick a sv user)`,
-      `${whiteDotEmoji} \`!mute\` - (Muts a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}automod on/off\` - (Auto moderation for sv)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}ban\` - (Ban a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}kick\` - (Kick a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}mute\` - (Muts a sv user)`,
     ],
     [
-      `${whiteDotEmoji} \`!unban\` - (unban a user)`,
-      `${whiteDotEmoji} \`!unmute\` - (unmute a user)`,
-      `${whiteDotEmoji} \`!rape\` - (Rape a sv user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}unban\` - (unban a user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}unmute\` - (unmute a user)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}rape\` - (Rape a sv user)`,
     ],
   ];
   const safePage = Math.max(0, Math.min(page, pages.length - 1));
@@ -1698,6 +1762,30 @@ function moderationCategoryComponents(
   ];
 }
 
+function musicRedirectComponents(user: {
+  tag?: string;
+  username: string;
+  id: string;
+}) {
+  const sentAt = Math.floor(Date.now() / 1000);
+  return [
+    {
+      type: 17,
+      accent_color: embedColor,
+      components: [
+        textComponent(
+          `**Hey <@${user.id}> , I'm an all rounder bot but we have launched other bots too...So, add our @Siyaa#3595 for a smooth music experience!**`,
+        ),
+        textComponent("_Thankyou_"),
+        separatorComponent(),
+        textComponent(
+          `-# - ${botName()} by ᗯɪɴᴅꜱ™ | ${requesterLabel(user)} • <t:${sentAt}:F>`,
+        ),
+      ],
+    },
+  ];
+}
+
 function makeCategoryResponseComponents(
   user: { tag?: string; username: string; id: string },
   categoryKey: string,
@@ -1708,7 +1796,11 @@ function makeCategoryResponseComponents(
   if (categoryKey === "moderation") {
     return moderationCategoryComponents(user, 0);
   }
+  if (categoryKey === "music") {
+    return musicRedirectComponents(user);
+  }
 
+  const categoryDetails = buildCategoryDetails();
   const category = categoryDetails[categoryKey] ?? categoryDetails.bot;
   const sentAt = Math.floor(Date.now() / 1000);
   const title =
@@ -1718,10 +1810,10 @@ function makeCategoryResponseComponents(
   const lines =
     categoryKey === "bot"
       ? [
-          `${whiteDotEmoji} \`!stats\` - (It will show the stats of ${botName()})`,
-          `${whiteDotEmoji} \`!uptime\` - (Show the current uptime of bot)`,
-          `${whiteDotEmoji} \`!ping\` and \`!pong\` - (Show current bot ping)`,
-          `${whiteDotEmoji} \`!premium\` - (View ${botName()} premium tiers)`,
+          `${whiteDotEmoji} \`${cmdPrefix()}stats\` - (It will show the stats of ${botName()})`,
+          `${whiteDotEmoji} \`${cmdPrefix()}uptime\` - (Show the current uptime of bot)`,
+          `${whiteDotEmoji} \`${cmdPrefix()}ping\` and \`${cmdPrefix()}pong\` - (Show current bot ping)`,
+          `${whiteDotEmoji} \`${cmdPrefix()}premium\` - (View ${botName()} premium tiers)`,
         ]
       : category.lines;
 
@@ -1750,16 +1842,16 @@ function securityCategoryComponents(
   const status = guildId ? securityStatus(guildId) : "Deactive";
   const pages = [
     [
-      `${whiteDotEmoji} \`!antinuke enable\` - (Activate protection)`,
-      `${whiteDotEmoji} \`!antinuke disable\` - (Deactivate protection)`,
-      `${whiteDotEmoji} \`!antinuke status\` - (View full status)`,
-      `${whiteDotEmoji} \`!antinuke events\` - (All protected events)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}antinuke enable\` - (Activate protection)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}antinuke disable\` - (Deactivate protection)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}antinuke status\` - (View full status)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}antinuke events\` - (All protected events)`,
     ],
     [
-      `${whiteDotEmoji} \`!whitelist add\` - (Add a member to whitelist)`,
-      `${whiteDotEmoji} \`!whitelist remove\` - (Remove a member from whitelist)`,
-      `${whiteDotEmoji} \`!whitelist show\` - (Show the current whitelist members)`,
-      `${whiteDotEmoji} \`!extraowner add/remove/show\` - (Manage extra-owners)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}whitelist add\` - (Add a member to whitelist)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}whitelist remove\` - (Remove a member from whitelist)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}whitelist show\` - (Show the current whitelist members)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}extraowner add/remove/show\` - (Manage extra-owners)`,
     ],
   ];
   const safePage = Math.max(0, Math.min(page, pages.length - 1));
@@ -1812,12 +1904,13 @@ function statsComponents(client: Client) {
 function makeHelpComponents(
   user: { tag?: string; username: string; id: string },
   guildName: string,
-  guildPrefix = prefix,
+  guildPrefix = cmdPrefix(),
   selectedCategory?: string,
   servedUsers = 0,
   categoryPage = 0,
 ) {
   const sentAt = Math.floor(Date.now() / 1000);
+  const categoryDetails = buildCategoryDetails();
   const category = selectedCategory
     ? categoryDetails[selectedCategory] ?? categoryDetails.bot
     : undefined;
@@ -1900,7 +1993,7 @@ function applyBotPresence(client: Client<true>) {
     status: "dnd",
     activities: [
       {
-        name: "!help • 2k+",
+        name: `${cmdPrefix()}help • 2k+`,
         type: ActivityType.Watching,
       },
     ],
@@ -1917,7 +2010,7 @@ function helpPayload(
     components: makeHelpComponents(
       user,
       guildName,
-      prefix,
+      cmdPrefix(),
       undefined,
       servedUsers,
     ),
@@ -2301,7 +2394,7 @@ async function respondToPremiumActivate(message: Message, args: string[]) {
     !durationMs
   ) {
     await message.reply(
-      "Usage: `!ap @user <1|2|3> <duration>` — example: `!ap @user 3 1000d`",
+      `Usage: \`${cmdPrefix()}ap @user <1|2|3> <duration>\` — example: \`${cmdPrefix()}ap @user 3 1000d\``,
     );
     return;
   }
@@ -2349,7 +2442,7 @@ async function respondToPremiumRemove(message: Message, args: string[]) {
 
   const userId = userIdFromArgument(args[0]);
   if (!userId) {
-    await message.reply("Usage: `!rp @user`");
+    await message.reply(`Usage: \`${cmdPrefix()}rp @user\``);
     return;
   }
 
@@ -2383,7 +2476,7 @@ async function respondToNoPrefixCommand(message: Message, args: string[]) {
   const action = args[0]?.toLowerCase();
   const userId = userIdFromArgument(args[1]);
   if (!userId || (action !== "add" && action !== "remove")) {
-    await message.reply("Usage: `!np add @user 30d` or `!np remove @user`");
+    await message.reply(`Usage: \`${cmdPrefix()}np add @user 30d\` or \`${cmdPrefix()}np remove @user\``);
     return;
   }
 
@@ -2396,7 +2489,7 @@ async function respondToNoPrefixCommand(message: Message, args: string[]) {
   const durationLabel = args[2]?.trim();
   const durationMs = durationLabel ? premiumDuration(durationLabel) : undefined;
   if (!durationLabel || !durationMs) {
-    await message.reply("Usage: `!np add @user 30d`");
+    await message.reply(`Usage: \`${cmdPrefix()}np add @user 30d\``);
     return;
   }
 
@@ -2814,7 +2907,7 @@ async function respondToAutoModCommand(message: Message, args: string[]) {
 
   const action = args[0]?.toLowerCase() ?? "on";
   if (action !== "on" && action !== "off") {
-    await message.reply("Usage: `!automod on` or `!automod off`");
+    await message.reply(`Usage: \`${cmdPrefix()}automod on\` or \`${cmdPrefix()}automod off\``);
     return;
   }
 
@@ -2981,7 +3074,7 @@ async function respondToModerationCommand(
       message,
       `**${botName()} - ${command.toUpperCase()}**`,
       [
-        `${redDotEmoji} **Usage :** \`!${command} @user [reason]\``,
+        `${redDotEmoji} **Usage :** \`${cmdPrefix()}${command} @user [reason]\``,
         command === "mute"
           ? `${whiteDotEmoji} Optional mute duration: \`10m\`, \`1h\`, or \`1d\``
           : `${whiteDotEmoji} Mention a server member or provide their user ID.`,
@@ -3071,13 +3164,13 @@ async function respondToUnbanCommand(message: Message, args: string[]) {
   }
 
   if (!canUseModerationCommand(message, PermissionFlagsBits.BanMembers)) {
-    await message.reply("You need the Ban Members permission to use !unban.");
+    await message.reply(`You need the Ban Members permission to use ${cmdPrefix()}unban.`);
     return;
   }
 
   const targetId = userIdFromArgument(args[0]);
   if (!targetId) {
-    await message.reply("Usage: `!unban <user ID>`");
+    await message.reply(`Usage: \`${cmdPrefix()}unban <user ID>\``);
     return;
   }
 
@@ -3110,13 +3203,13 @@ async function respondToUnmuteCommand(message: Message, args: string[]) {
   }
 
   if (!canUseModerationCommand(message, PermissionFlagsBits.ModerateMembers)) {
-    await message.reply("You need the Moderate Members permission to use !unmute.");
+    await message.reply(`You need the Moderate Members permission to use ${cmdPrefix()}unmute.`);
     return;
   }
 
   const targetId = userIdFromArgument(args[0]);
   if (!targetId) {
-    await message.reply("Usage: `!unmute @user [reason]`");
+    await message.reply(`Usage: \`${cmdPrefix()}unmute @user [reason]\``);
     return;
   }
 
@@ -3163,7 +3256,7 @@ async function respondToUnsafeRapeCommand(message: Message) {
     [
       `${redDotEmoji} **This command is disabled.**`,
       `${botName()} does not perform or simulate sexual violence against server members.`,
-      `${whiteDotEmoji} Use \`!mute\`, \`!kick\`, or \`!ban\` for server moderation.`,
+      `${whiteDotEmoji} Use \`${cmdPrefix()}mute\`, \`${cmdPrefix()}kick\`, or \`${cmdPrefix()}ban\` for server moderation.`,
     ],
     0xef4444,
   );
@@ -3190,7 +3283,7 @@ async function respondToBotUtilityCommand(
     const targetId = userIdFromArgument(args[0]);
     const content = args.slice(1).join(" ").trim();
     if (!targetId || !content) {
-      await message.reply("Usage: `!dm @user <message>`");
+      await message.reply(`Usage: \`${cmdPrefix()}dm @user <message>\``);
       return;
     }
 
@@ -3231,7 +3324,7 @@ async function respondToBotUtilityCommand(
             separatorComponent(),
             textComponent(
               [
-                "1. Use cmd `!embed send`",
+                `1. Use cmd \`${cmdPrefix()}embed send\``,
                 `2. Write your heading normally, eg. \`${botName()} - heading\` (it will always be big)`,
                 "3. Use `**message**` when you want bold text",
                 "4. Attach a photo to show it beside the heading",
@@ -3255,7 +3348,7 @@ async function respondToBotUtilityCommand(
   const embedArgs = isEmbedSend ? args.slice(1) : args;
   const content = embedArgs.join(" ").trim();
   if (!content) {
-    await message.reply(`Usage: \`!${command} <message>\``);
+    await message.reply(`Usage: \`${cmdPrefix()}${command} <message>\``);
     return;
   }
 
@@ -3439,7 +3532,7 @@ async function createTicket(
     ? guild.channels.cache.get(config.categoryId)
     : undefined;
   if (!category || category.type !== ChannelType.GuildCategory) {
-    throw new Error("Ticket system is not set up. Use !ticket setup first.");
+    throw new Error(`Ticket system is not set up. Use ${cmdPrefix()}ticket setup first.`);
   }
 
   const existing = ticketChannelForUser(guild, userId);
@@ -3545,7 +3638,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
                   `${whiteDotEmoji} **Ticket Category:** <#${config.categoryId}>`,
                   `${whiteDotEmoji} **Logs:** <#${config.logChannelId}>`,
                   "",
-                  "Use `!ticket panel` to send the ticket panel.",
+                  `Use \`${cmdPrefix()}ticket panel\` to send the ticket panel.`,
                 ].join("\n"),
               ),
             ],
@@ -3589,44 +3682,44 @@ async function respondToTicketCommand(message: Message, args: string[]) {
     if (field === "heading") {
       const value = args.slice(2).join(" ").trim();
       if (!value) {
-        await message.reply("Usage: `!ticket customize heading <text>`");
+        await message.reply(`Usage: \`${cmdPrefix()}ticket customize heading <text>\``);
         return;
       }
       panel.heading = value.startsWith("#") ? value : `# ${value}`;
-      await message.reply("Ticket panel heading updated. Run `!ticket panel` to send the updated panel.");
+      await message.reply(`Ticket panel heading updated. Run \`${cmdPrefix()}ticket panel\` to send the updated panel.`);
       return;
     }
 
     if (field === "center" || field === "description") {
       const value = args.slice(2).join(" ").trim();
       if (!value) {
-        await message.reply("Usage: `!ticket customize center <text>`");
+        await message.reply(`Usage: \`${cmdPrefix()}ticket customize center <text>\``);
         return;
       }
       panel.description = value;
-      await message.reply("Ticket panel center text updated. Run `!ticket panel` to send the updated panel.");
+      await message.reply(`Ticket panel center text updated. Run \`${cmdPrefix()}ticket panel\` to send the updated panel.`);
       return;
     }
 
     if (field === "footer") {
       const value = args.slice(2).join(" ").trim();
       if (!value) {
-        await message.reply("Usage: `!ticket customize footer <text>`");
+        await message.reply(`Usage: \`${cmdPrefix()}ticket customize footer <text>\``);
         return;
       }
       panel.footer = value;
-      await message.reply("Ticket panel footer updated. Run `!ticket panel` to send the updated panel.");
+      await message.reply(`Ticket panel footer updated. Run \`${cmdPrefix()}ticket panel\` to send the updated panel.`);
       return;
     }
 
     if (field === "color") {
       const rawColor = args[2]?.replace(/^#/, "");
       if (!rawColor || !/^[\da-f]{6}$/i.test(rawColor)) {
-        await message.reply("Usage: `!ticket customize color <6-digit hex>` — example: `#5865F2`");
+        await message.reply(`Usage: \`${cmdPrefix()}ticket customize color <6-digit hex>\` — example: \`#5865F2\``);
         return;
       }
       panel.color = Number.parseInt(rawColor, 16);
-      await message.reply("Ticket panel accent color updated. Run `!ticket panel` to send the updated panel.");
+      await message.reply(`Ticket panel accent color updated. Run \`${cmdPrefix()}ticket panel\` to send the updated panel.`);
       return;
     }
 
@@ -3647,7 +3740,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
       if (field === "button") {
         const label = args.slice(3).join(" ").trim();
         if (!label) {
-          await message.reply("Usage: `!ticket customize button <type> <label>`");
+          await message.reply(`Usage: \`${cmdPrefix()}ticket customize button <type> <label>\``);
           return;
         }
         button.label = label.slice(0, 80);
@@ -3658,7 +3751,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
       if (field === "emoji") {
         const emoji = args.slice(3).join(" ").trim();
         if (!emoji) {
-          await message.reply("Usage: `!ticket customize emoji <type> <emoji|none>`");
+          await message.reply(`Usage: \`${cmdPrefix()}ticket customize emoji <type> <emoji|none>\``);
           return;
         }
         button.emoji = emoji.toLowerCase() === "none" ? undefined : emoji;
@@ -3684,7 +3777,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
 
       const enabled = args[3]?.toLowerCase();
       if (enabled !== "on" && enabled !== "off") {
-        await message.reply("Usage: `!ticket customize toggle <type> <on|off>`");
+        await message.reply(`Usage: \`${cmdPrefix()}ticket customize toggle <type> <on|off>\``);
         return;
       }
       button.enabled = enabled === "on";
@@ -3692,7 +3785,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
       return;
     }
 
-    await message.reply("Unknown customization. Use `!ticket customize show` to view the available options.");
+    await message.reply(`Unknown customization. Use \`${cmdPrefix()}ticket customize show\` to view the available options.`);
     return;
   }
 
@@ -3704,7 +3797,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
       return;
     }
     if (!ticketConfig(message.guild.id).categoryId) {
-      await message.reply("Use `!ticket setup` first.");
+      await message.reply(`Use \`${cmdPrefix()}ticket setup\` first.`);
       return;
     }
     await message.reply({
@@ -3753,17 +3846,17 @@ async function respondToTicketCommand(message: Message, args: string[]) {
     await message.reply(
       [
         `**${botName()} Ticket Commands**`,
-        "`!ticket setup` — create the ticket category, support role, and logs",
-        "`!ticket panel` — send the ticket panel",
-        "`!ticket customize show` — view the current panel design",
-        "`!ticket customize ...` — edit the heading, center text, footer, color, and buttons",
-        "`!ticket create [general|partnership|report|purchase|bug]` — create a ticket",
-        "`!ticket close` / `!ticket reopen` — change ticket status",
-        "`!ticket claim` — claim a ticket",
-        "`!ticket add @user` / `!ticket remove @user` — manage members",
-        "`!ticket rename <name>` — rename the current ticket",
-        "`!ticket transcript` — save the last 100 messages to logs",
-        "`!ticket delete` — permanently delete the current ticket",
+        `\`${cmdPrefix()}ticket setup\` — create the ticket category, support role, and logs`,
+        `\`${cmdPrefix()}ticket panel\` — send the ticket panel`,
+        `\`${cmdPrefix()}ticket customize show\` — view the current panel design`,
+        `\`${cmdPrefix()}ticket customize ...\` — edit the heading, center text, footer, color, and buttons`,
+        `\`${cmdPrefix()}ticket create [general|partnership|report|purchase|bug]\` — create a ticket`,
+        `\`${cmdPrefix()}ticket close\` / \`${cmdPrefix()}ticket reopen\` — change ticket status`,
+        `\`${cmdPrefix()}ticket claim\` — claim a ticket`,
+        `\`${cmdPrefix()}ticket add @user\` / \`${cmdPrefix()}ticket remove @user\` — manage members`,
+        `\`${cmdPrefix()}ticket rename <name>\` — rename the current ticket`,
+        `\`${cmdPrefix()}ticket transcript\` — save the last 100 messages to logs`,
+        `\`${cmdPrefix()}ticket delete\` — permanently delete the current ticket`,
       ].join("\n"),
     );
     return;
@@ -3847,7 +3940,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
     }
     const userId = userIdFromArgument(args[1]);
     if (!userId) {
-      await message.reply(`Usage: \`!ticket ${action} @user\``);
+      await message.reply(`Usage: \`${cmdPrefix()}ticket ${action} @user\``);
       return;
     }
     if (action === "add") {
@@ -3872,7 +3965,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
       .replace(/^-+|-+$/g, "")
       .slice(0, 85);
     if (!name) {
-      await message.reply("Usage: `!ticket rename <name>`");
+      await message.reply(`Usage: \`${cmdPrefix()}ticket rename <name>\``);
       return;
     }
     await channel.setName(`ticket-${name}`);
@@ -3904,7 +3997,7 @@ async function respondToTicketCommand(message: Message, args: string[]) {
     });
     await message.reply("Transcript saved to the ticket logs.");
   } else {
-    await message.reply("Unknown ticket command. Use `!ticket help`.");
+    await message.reply(`Unknown ticket command. Use \`${cmdPrefix()}ticket help\`.`);
   }
 }
 
@@ -3940,7 +4033,7 @@ async function handleTicketBuilderButton(interaction: ButtonInteraction) {
     );
     if (!draft) {
       await interaction.reply({
-        content: "Your ticket panel form expired. Run `!ticket panel` and try again.",
+        content: `Your ticket panel form expired. Run \`${cmdPrefix()}ticket panel\` and try again.`,
         ephemeral: true,
       });
       return;
@@ -4115,7 +4208,7 @@ async function handleTicketBuilderButtonsModal(
   );
   if (!draft) {
     await interaction.reply({
-      content: "Your ticket panel form expired. Run `!ticket panel` and try again.",
+      content: `Your ticket panel form expired. Run \`${cmdPrefix()}ticket panel\` and try again.`,
       ephemeral: true,
     });
     return;
@@ -4174,7 +4267,7 @@ async function handleTicketBuilderButtonColor(
     !selected
   ) {
     await interaction.reply({
-      content: "Your ticket panel form expired. Run `!ticket panel` and try again.",
+      content: `Your ticket panel form expired. Run \`${cmdPrefix()}ticket panel\` and try again.`,
       ephemeral: true,
     });
     return;
@@ -4370,7 +4463,7 @@ async function respondToSecurityCommand(
       } as never);
     } else {
       await message.reply(
-        "Usage: `!antinuke enable`, `!antinuke disable`, `!antinuke status`, or `!antinuke events`",
+        `Usage: \`${cmdPrefix()}antinuke enable\`, \`${cmdPrefix()}antinuke disable\`, \`${cmdPrefix()}antinuke status\`, or \`${cmdPrefix()}antinuke events\``,
       );
     }
     return;
@@ -4408,7 +4501,7 @@ async function respondToSecurityCommand(
     const userId = userIdFromArgument(args[1]);
     if (!userId) {
       await message.reply(
-        `Usage: \`!${command} ${action} @user\``,
+        `Usage: \`${cmdPrefix()}${command} ${action} @user\``,
       );
       return;
     }
@@ -4444,7 +4537,7 @@ async function respondToSecurityCommand(
     }
   } else {
     await message.reply(
-      `Usage: \`!${command} add @user\`, \`!${command} remove @user\`, or \`!${command} show\``,
+      `Usage: \`${cmdPrefix()}${command} add @user\`, \`${cmdPrefix()}${command} remove @user\`, or \`${cmdPrefix()}${command} show\``,
     );
   }
 }
@@ -4511,7 +4604,7 @@ async function handleHelpPagesButton(interaction: ButtonInteraction) {
     components: makeHelpComponents(
       interaction.user,
       interaction.guild?.name ?? "Direct Message",
-      prefix,
+      cmdPrefix(),
       undefined,
       servingUserCount(interaction.client),
       nextPage,
@@ -4637,6 +4730,12 @@ async function handleWhitelistShowButton(interaction: ButtonInteraction) {
 }
 
 export async function startRazeBot() {
+  if (botStarted) {
+    logger.warn("startRazeBot called twice; ignoring the duplicate login attempt");
+    return;
+  }
+  botStarted = true;
+
   if (!token) {
     throw new Error(
       `DISCORD_BOT_TOKEN is missing. Add it to the project secrets before starting ${botName()}.`,
@@ -4660,7 +4759,43 @@ export async function startRazeBot() {
     logger.error({ err: error }, "ZAIR Discord client error");
   });
 
+  client.on(Events.Warn, (info) => {
+    logger.warn({ info }, "ZAIR Discord client warning");
+  });
+
+  client.on(Events.ShardDisconnect, (event, shardId) => {
+    botReady = false;
+    logger.warn(
+      { code: event.code, shardId },
+      "ZAIR gateway disconnected; discord.js will reconnect automatically",
+    );
+  });
+
+  client.on(Events.ShardReconnecting, (shardId) => {
+    logger.warn({ shardId }, "ZAIR gateway reconnecting");
+  });
+
+  client.on(Events.ShardReady, (shardId) => {
+    botReady = true;
+    logger.info({ shardId }, "ZAIR gateway shard ready");
+  });
+
+  client.on(Events.ShardResume, (shardId, replayedEvents) => {
+    botReady = true;
+    logger.info({ shardId, replayedEvents }, "ZAIR gateway session resumed");
+  });
+
+  client.on(Events.ShardError, (error, shardId) => {
+    logger.error({ err: error, shardId }, "ZAIR gateway shard error");
+  });
+
+  client.on(Events.Invalidated, () => {
+    logger.fatal("ZAIR Discord session was invalidated; exiting so Render restarts the service");
+    process.exit(1);
+  });
+
   client.once(Events.ClientReady, async (readyClient) => {
+    botReady = true;
     logger.info(
       { guildCount: readyClient.guilds.cache.size },
       "ZAIR Discord client ready",
@@ -4813,7 +4948,8 @@ export async function startRazeBot() {
     }
   });
 
-  client.on(Events.InteractionCreate, async (interaction) => {
+  client.on(Events.InteractionCreate, (interaction) =>
+    prefixContext.run({ prefix: getPrefix(interaction.guildId ?? undefined) }, async () => {
     try {
       if (interaction.isChatInputCommand() && interaction.commandName === "help") {
         await respondToHelpOnce(interaction.id, () =>
@@ -4891,9 +5027,10 @@ export async function startRazeBot() {
         }
       }
     }
-  });
+  }));
 
-  client.on(Events.MessageCreate, async (message) => {
+  client.on(Events.MessageCreate, (message) =>
+    prefixContext.run({ prefix: getPrefix(message.guild?.id) }, async () => {
     try {
       if (message.author.bot) {
         return;
@@ -4921,13 +5058,26 @@ export async function startRazeBot() {
         ? message.content.trim().replace(botMentionPattern, "").trim()
         : message.content.trim();
 
-      const hasPrefix = commandContent.startsWith(prefix);
+      const activePrefix = getPrefix(message.guild?.id);
+      if (
+        botMentionPattern &&
+        commandContent === "" &&
+        botMentionPattern.test(message.content.trim())
+      ) {
+        await message.reply({
+          content: `Hey ${message.author}, my prefix here is \`${activePrefix}\` — use \`${activePrefix}help\` to see all my commands.`,
+          allowedMentions: { repliedUser: false },
+        });
+        return;
+      }
+
+      const hasPrefix = commandContent.startsWith(activePrefix);
       if (!hasPrefix && !hasNoPrefixAccess(message.author.id)) {
         return;
       }
 
       const [command, ...args] = commandContent
-        .slice(hasPrefix ? prefix.length : 0)
+        .slice(hasPrefix ? activePrefix.length : 0)
         .trim()
         .split(/\s+/);
       const normalizedCommand = resolveCommandAlias(
@@ -5029,7 +5179,7 @@ export async function startRazeBot() {
     } catch (error) {
       logger.error({ err: error }, `${botName()} prefix command failed`);
     }
-  });
+  }));
 
   logger.info("ZAIR connecting to the Discord gateway");
   await client.login(token);

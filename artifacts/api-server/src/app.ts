@@ -3,6 +3,7 @@ import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
+import { getBotStatus } from "./lib/raze-bot";
 
 const app: Express = express();
 
@@ -29,13 +30,21 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Keep-alive endpoints for Render / UptimeRobot (point the monitor at "/" or "/ping")
-app.get("/", (_req, res) => {
-  res.status(200).send("Bot is online ✅");
-});
-app.get("/ping", (_req, res) => {
-  res.status(200).json({ status: "ok", uptime: Math.round(process.uptime()) });
-});
+// Keep-alive + REAL status endpoints for Render / UptimeRobot.
+// These report the actual Discord connection: 200 only when ZAIR is connected
+// to the Discord gateway, 503 when the web server is up but the bot is not.
+// (/api/healthz stays a plain "process is alive" check.)
+function discordStatusHandler(_req: express.Request, res: express.Response) {
+  const status = getBotStatus();
+  res.status(status.ready ? 200 : 503).json({
+    status: status.ready ? "online" : "discord-disconnected",
+    discord: status,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+}
+app.get("/", discordStatusHandler);
+app.get("/ping", discordStatusHandler);
+app.get("/status", discordStatusHandler);
 
 app.use("/api", router);
 
