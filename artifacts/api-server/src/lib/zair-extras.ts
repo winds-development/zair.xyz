@@ -7,6 +7,7 @@ import {
   Events,
   MessageFlags,
   PermissionFlagsBits,
+  Routes,
   version as djsVersion,
   type Client,
   type Guild,
@@ -33,6 +34,23 @@ export function flushExtras() {
 }
 
 let extrasClient: Client | null = null;
+
+// Premium grants live in raze-bot.ts; extras only needs to read them and keep
+// a copy on disk so they survive a restart.
+let premiumLookup: (userId: string) => number | null = () => null;
+
+export function setPremiumLookup(lookup: (userId: string) => number | null) {
+  premiumLookup = lookup;
+}
+
+export function savePremiumSnapshot(entries: Record<string, PremiumRecord>) {
+  store.premium = entries;
+  scheduleSave();
+}
+
+export function loadPremiumSnapshot(): Record<string, PremiumRecord> {
+  return store.premium;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Shortcut aliases (work only with the prefix, e.g. !si  !lp  !inv)   */
@@ -111,6 +129,8 @@ const commandAliases: Record<string, string> = {
   dice: "roll",
   stl: "steal",
   yoink: "steal",
+  sav: "setavatar",
+  sbn: "setbanner",
 };
 
 const extraCommandNames = new Set([
@@ -161,6 +181,8 @@ const extraCommandNames = new Set([
   "flip",
   "roll",
   "steal",
+  "setavatar",
+  "setbanner",
 ]);
 
 // These work in DMs too; everything else needs a server.
@@ -218,6 +240,13 @@ type Reminder = {
   at: number;
 };
 
+type PremiumRecord = {
+  tierNumber: 1 | 2 | 3;
+  tierName: string;
+  durationLabel: string;
+  expiresAt: number;
+};
+
 type CozAccount = { balance: number; lastDaily: number; streak: number };
 
 type Store = {
@@ -231,6 +260,9 @@ type Store = {
   prefixes: Record<string, string>;
   birthdays: Record<string, { day: number; month: number }>;
   reminders: Reminder[];
+  inviteCodes: Record<string, { inviterId: string | null; uses: number }>;
+  inviteOffsets: Record<string, number>;
+  premium: Record<string, PremiumRecord>;
 };
 
 const dataFile =
@@ -252,6 +284,9 @@ function emptyStore(): Store {
     prefixes: {},
     birthdays: {},
     reminders: [],
+    inviteCodes: {},
+    inviteOffsets: {},
+    premium: {},
   };
 }
 
@@ -310,9 +345,20 @@ function cacheFromInvites(invites: Iterable<Invite>) {
   return map;
 }
 
+function upsertInvites(guildId: string, invites: Iterable<Invite>) {
+  for (const invite of invites) {
+    store.inviteCodes[`${guildId}:${invite.code}`] = {
+      inviterId: invite.inviter?.id ?? null,
+      uses: invite.uses ?? 0,
+    };
+  }
+  scheduleSave();
+}
+
 async function cacheGuildInvites(guild: Guild) {
   try {
     const invites = await guild.invites.fetch();
+    upsertInvites(guild.id, invites.values());
     inviteCache.set(guild.id, cacheFromInvites(invites.values()));
     noInvitePermission.delete(guild.id);
   } catch {
@@ -333,7 +379,9 @@ async function detectInviter(guild: Guild): Promise<InviterRecord> {
 
   try {
     const fresh = await guild.invites.fetch();
+    upsertInvites(guild.id, fresh.values());
     noInvitePermission.delete(guild.id);
+    let usedFromDeleted = false;
 
     let usedCode: string | null = null;
     let usedInviter: string | null = null;
@@ -360,8 +408,16 @@ async function detectInviter(guild: Guild): Promise<InviterRecord> {
         ) {
           usedCode = code;
           usedInviter = cached.inviterId;
+          usedFromDeleted = true;
           break;
         }
+      }
+    }
+
+    if (usedCode && usedFromDeleted) {
+      const entry = store.inviteCodes[`${guild.id}:${usedCode}`];
+      if (entry) {
+        entry.uses += 1;
       }
     }
 
@@ -446,6 +502,11 @@ export async function initExtras(client: Client) {
       inviterId: invite.inviter?.id ?? null,
     });
     inviteCache.set(guildId, map);
+    store.inviteCodes[`${guildId}:${invite.code}`] = {
+      inviterId: invite.inviter?.id ?? null,
+      uses: invite.uses ?? 0,
+    };
+    scheduleSave();
   });
 
   client.on(Events.InviteDelete, (invite) => {
@@ -707,6 +768,8 @@ export async function respondToExtraCommand(
     case "flip": return respondFlip(message);
     case "roll": return respondRoll(message, args);
     case "steal": return respondSteal(message, args);
+    case "setavatar": return respondSetProfileImage(message, args, "avatar");
+    case "setbanner": return respondSetProfileImage(message, args, "banner");
     default:
       break;
   }
@@ -773,30 +836,67 @@ function respondServerInfo(message: Message, guild: Guild) {
   ]);
 }
 
+function invitesTotalFor(guildId: string, userId: string) {
+  const prefix = `${guildId}:`;
+  let total = 0;
+  let links = 0;
+  for (const [key, entry] of Object.entries(store.inviteCodes)) {
+    if (key.startsWith(prefix) && entry.inviterId === userId) {
+      total += entry.uses;
+      links += 1;
+    }
+  }
+  const offset = store.inviteOffsets[`${guildId}:${userId}`] ?? 0;
+  return { total: Math.max(0, total - offset), links, raw: total };
+}
+
 async function respondInvites(message: Message, args: string[]) {
   const guild = message.guild!;
   const user = await resolveTarget(message, args);
-  const stat = store.inviteStats[`${guild.id}:${user.id}`] ?? {
-    joins: 0,
-    leaves: 0,
-  };
-  const current = Math.max(0, stat.joins - stat.leaves);
+
+  // Refresh the live counters first: every invite link keeps its own lifetime
+  // "uses" number, which also includes joins from BEFORE this bot was added.
+  await cacheGuildInvites(guild);
+
+  const { total, links } = invitesTotalFor(guild.id, user.id);
+  const stat = store.inviteStats[`${guild.id}:${user.id}`] ?? { joins: 0, leaves: 0 };
+  const left = Math.min(stat.leaves, total);
+  const real = Math.max(0, total - left);
 
   const lines = [
     `${dot} **User :** ${user}`,
-    `${dot} **Total Invites :** \`${stat.joins}\``,
-    `${dot} **Left :** \`${stat.leaves}\``,
-    `${dot} **Still In Server :** \`${current}\``,
+    `${dot} **Total Invites :** \`${total}\``,
+    `${dot} **Invite Links Counted :** \`${links}\``,
+    `${dot} **Left (since bot joined) :** \`${left}\``,
+    `${dot} **Still In Server :** \`${real}\``,
   ];
   if (noInvitePermission.has(guild.id)) {
     lines.push(
       "",
-      "I need the **Manage Server** permission to track invites in this server.",
+      "I need the **Manage Server** permission to read invites in this server.",
     );
   } else {
-    lines.push("", "-# Counted from when the bot started tracking invites.");
+    lines.push(
+      "",
+      "-# Counts the uses of this user's invite links, including joins from before the bot was added. Links deleted before the bot joined cannot be counted, and members who left before then cannot be detected.",
+    );
   }
   return card(message, "Invites", lines);
+}
+
+async function resetInviteOffsets(guild: Guild, userId: string | null) {
+  await cacheGuildInvites(guild);
+  const prefix = `${guild.id}:`;
+  const inviters = new Set<string>();
+  for (const [key, entry] of Object.entries(store.inviteCodes)) {
+    if (key.startsWith(prefix) && entry.inviterId) {
+      inviters.add(entry.inviterId);
+    }
+  }
+  for (const inviterId of userId ? [userId] : inviters) {
+    store.inviteOffsets[`${guild.id}:${inviterId}`] = invitesTotalFor(guild.id, inviterId).raw;
+  }
+  scheduleSave();
 }
 
 async function respondInviter(message: Message, args: string[]) {
@@ -1165,6 +1265,9 @@ async function respondReset(
         removed += 1;
       }
     }
+    if (command === "resetinvites") {
+      await resetInviteOffsets(message.guild!, null);
+    }
     scheduleSave();
     return card(message, `Reset ${label}`, [
       `${dot} Reset **${label}** for everyone in this server (\`${removed}\` record(s) cleared).`,
@@ -1173,6 +1276,9 @@ async function respondReset(
 
   if (targetId) {
     const existed = delete bucket[`${guildId}:${targetId}`];
+    if (command === "resetinvites") {
+      await resetInviteOffsets(message.guild!, targetId);
+    }
     scheduleSave();
     return card(message, `Reset ${label}`, [
       `${dot} Reset **${label}** for <@${targetId}>.`,
@@ -2147,4 +2253,110 @@ async function respondSteal(message: Message, args: string[]) {
     added.length ? `${dot} **Added :** ${added.join(" ")}` : "",
     failed.length ? `${dot} **Failed :** ${failed.join(", ")} (no free slots or missing permission)` : "",
   ].filter(Boolean));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Bot profile for THIS server (avatar / banner) - server owner only   */
+/* ------------------------------------------------------------------ */
+
+async function readImageInput(
+  message: Message,
+  args: string[],
+): Promise<{ dataUri: string; url: string } | string> {
+  let url: string | undefined = message.attachments.first()?.url;
+  if (!url && message.reference?.messageId) {
+    const replied = await message.channel.messages
+      .fetch(message.reference.messageId)
+      .catch(() => null);
+    url = replied?.attachments.first()?.url;
+  }
+  if (!url) {
+    url = args.find((arg) => /^https?:\/\//i.test(arg));
+  }
+  if (!url) {
+    return "Attach an image (PNG, JPG, WEBP or GIF), reply to a message with one, or paste an image link.";
+  }
+
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) {
+      return "I could not download that image.";
+    }
+    const type = (response.headers.get("content-type") ?? "").split(";")[0]!.trim();
+    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(type)) {
+      return "That file is not a PNG, JPG, WEBP or GIF image.";
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > 8 * 1024 * 1024) {
+      return "That image is too big. Keep it under 8 MB.";
+    }
+    return { dataUri: `data:${type};base64,${bytes.toString("base64")}`, url };
+  } catch {
+    return "I could not download that image.";
+  }
+}
+
+async function respondSetProfileImage(
+  message: Message,
+  args: string[],
+  kind: "avatar" | "banner",
+) {
+  const guild = message.guild!;
+  const label = kind === "avatar" ? "Avatar" : "Banner";
+
+  if (guild.ownerId !== message.author.id) {
+    return card(message, `Set ${label}`, [
+      `Only the **server owner** (<@${guild.ownerId}>) can change the bot ${kind} in this server.`,
+    ]);
+  }
+
+  const tier = premiumLookup(message.author.id);
+  if (!tier || tier < 2) {
+    return card(message, `Set ${label}`, [
+      `Changing the bot ${kind} is a **Premium Tier 2 (Guild-Prime)** perk, and the server owner needs an active Tier 2 (or Tier 3) plan.`,
+      `Use \`${cmdPrefix()}premium\` to see the plans.`,
+    ]);
+  }
+
+  const reset = args[0]?.toLowerCase() === "reset";
+  let body: Record<string, string | null>;
+  let preview: string[] = [];
+
+  if (reset) {
+    body = { [kind]: null };
+  } else {
+    const image = await readImageInput(message, args);
+    if (typeof image === "string") {
+      return card(message, `Set ${label}`, [
+        image,
+        `Usage: \`${cmdPrefix()}set${kind}\` with an image attached, or \`${cmdPrefix()}set${kind} reset\``,
+      ]);
+    }
+    body = { [kind]: image.dataUri };
+    preview = [image.url];
+  }
+
+  try {
+    await message.client.rest.patch(Routes.guildMember(guild.id, "@me"), {
+      body,
+      reason: `Bot ${kind} changed by ${message.author.tag}`,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return card(message, `Set ${label}`, [
+      `Discord did not accept the ${kind} change: ${cleanText(detail, 200)}`,
+      "Tip: Discord limits how often a bot profile can change. Try again in a while, or use a smaller PNG/JPG if a GIF is rejected.",
+    ]);
+  }
+
+  return card(
+    message,
+    `Set ${label}`,
+    [
+      reset
+        ? `${dot} The bot ${kind} for this server was reset to default.`
+        : `${dot} The bot ${kind} for **${guild.name}** was updated.`,
+    ],
+    preview,
+  );
 }

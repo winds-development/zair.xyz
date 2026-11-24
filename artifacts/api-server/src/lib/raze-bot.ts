@@ -32,6 +32,9 @@ import { logger } from "./logger";
 import {
   cmdPrefix,
   flushExtras,
+  loadPremiumSnapshot,
+  savePremiumSnapshot,
+  setPremiumLookup,
   getPrefix,
   initExtras,
   isExtraCommand,
@@ -1769,6 +1772,8 @@ function botCategoryComponents(
       `${whiteDotEmoji} \`${cmdPrefix()}say\` - (Say something by bot)`,
       `${whiteDotEmoji} \`${cmdPrefix()}embed\` - (View the embed guide)`,
       `${whiteDotEmoji} \`${cmdPrefix()}dm\` - (Dm a particular user by bot)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}setavatar\` - (Premium Tier 2, server owner: set the bot avatar in this server) • \`${cmdPrefix()}sav\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}setbanner\` - (Premium Tier 2, server owner: set the bot banner in this server) • \`${cmdPrefix()}sbn\``,
     ],
   ];
   const safePage = Math.max(0, Math.min(page, pages.length - 1));
@@ -2385,6 +2390,7 @@ async function expirePremium(userId: string, client: Client) {
   }
 
   premiumGrants.delete(userId);
+  persistPremium();
   noPrefixGrants.delete(userId);
   premiumExpiryTimers.delete(userId);
 
@@ -2417,6 +2423,49 @@ function schedulePremiumExpiry(
     Math.min(remainingMs, maxTimerMs),
   );
   premiumExpiryTimers.set(userId, timer);
+}
+
+function activePremiumTier(userId: string): number | null {
+  if (userId === botOwnerUserId) {
+    return 3;
+  }
+  const grant = premiumGrants.get(userId);
+  return grant && grant.expiresAt.getTime() > Date.now() ? grant.tierNumber : null;
+}
+
+function persistPremium() {
+  savePremiumSnapshot(
+    Object.fromEntries(
+      [...premiumGrants].map(([userId, grant]) => [
+        userId,
+        {
+          tierNumber: grant.tierNumber,
+          tierName: grant.tierName,
+          durationLabel: grant.durationLabel,
+          expiresAt: grant.expiresAt.getTime(),
+        },
+      ]),
+    ),
+  );
+}
+
+function restorePremium(client: Client) {
+  for (const [userId, saved] of Object.entries(loadPremiumSnapshot())) {
+    if (saved.expiresAt <= Date.now()) {
+      continue;
+    }
+    const grant: PremiumGrant = {
+      tierNumber: saved.tierNumber,
+      tierName: saved.tierName,
+      durationLabel: saved.durationLabel,
+      expiresAt: new Date(saved.expiresAt),
+    };
+    premiumGrants.set(userId, grant);
+    persistPremium();
+    updateNoPrefixForPremium(userId, grant);
+    schedulePremiumExpiry(userId, grant, client);
+  }
+  persistPremium();
 }
 
 function hasNoPrefixAccess(userId: string) {
@@ -2519,6 +2568,7 @@ async function respondToPremiumRemove(message: Message, args: string[]) {
   try {
     const user = await message.client.users.fetch(userId);
     premiumGrants.delete(userId);
+    persistPremium();
     noPrefixGrants.delete(userId);
     const expiryTimer = premiumExpiryTimers.get(userId);
     if (expiryTimer) {
@@ -4827,6 +4877,8 @@ export async function startRazeBot() {
 
   activeClient = client;
   await initExtras(client);
+  setPremiumLookup(activePremiumTier);
+  restorePremium(client);
 
   client.on(Events.Error, (error) => {
     recordError(error);
