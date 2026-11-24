@@ -37,9 +37,10 @@ const server = app.listen(port, "0.0.0.0", (err) => {
 });
 
 // Start the Discord bot in the same process.
+// If login fails the process stays up so /status can show the reason; the
+// watchdog below restarts the service if the bot is still offline after 3 min.
 void startRazeBot().catch((error) => {
   logger.error({ err: error }, "ZAIR failed to start / log in to Discord");
-  process.exit(1);
 });
 
 // Watchdog: the website can stay "live" while the Discord gateway is dead.

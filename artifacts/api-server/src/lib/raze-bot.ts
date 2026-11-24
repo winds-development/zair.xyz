@@ -47,6 +47,33 @@ let activeClient: Client | null = null;
 let botStarted = false;
 let botReady = false;
 
+const diagnostics: {
+  phase: string;
+  lastError: string | null;
+  lastDisconnectCode: number | null;
+  hint: string | null;
+} = { phase: "starting", lastError: null, lastDisconnectCode: null, hint: null };
+
+function hintFor(codeOrMessage: number | string | null): string | null {
+  const text = String(codeOrMessage ?? "").toLowerCase();
+  if (text === "4004" || text.includes("invalid token") || text.includes("token_invalid")) {
+    return "Discord rejected the bot token. Reset the token in Discord Developer Portal -> Bot, then update DISCORD_BOT_TOKEN on Render (no spaces or quotes).";
+  }
+  if (text === "4013" || text === "4014" || text.includes("disallowed intents") || text.includes("invalid intents")) {
+    return "Privileged intents are off. In Discord Developer Portal -> Bot, enable Server Members Intent and Message Content Intent, then redeploy.";
+  }
+  if (text.includes("429") || text.includes("1015") || text.includes("rate")) {
+    return "Discord is rate limiting or blocking this Render IP. Wait 10-15 minutes without redeploying, or use Render's Manual Deploy -> Clear build cache & deploy later.";
+  }
+  return null;
+}
+
+function recordError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  diagnostics.lastError = message.slice(0, 300);
+  diagnostics.hint = hintFor(message) ?? diagnostics.hint;
+}
+
 export function getBotStatus() {
   const client = activeClient;
   return {
@@ -54,6 +81,10 @@ export function getBotStatus() {
     user: client?.user?.tag ?? null,
     guilds: client?.guilds.cache.size ?? 0,
     pingMs: client && client.ws.ping >= 0 ? Math.round(client.ws.ping) : null,
+    phase: diagnostics.phase,
+    lastError: diagnostics.lastError,
+    lastDisconnectCode: diagnostics.lastDisconnectCode,
+    hint: diagnostics.hint,
   };
 }
 
@@ -76,7 +107,7 @@ function botName(): string {
   return user?.displayName || user?.username || fallbackBotName;
 }
 
-const token = process.env["DISCORD_BOT_TOKEN"];
+const token = process.env["DISCORD_BOT_TOKEN"]?.trim().replace(/^["']|["']$/g, "");
 const execFile = promisify(execFileCallback);
 const embedColor = 0x2b2d31;
 const redDotEmoji = "<:glowing_dot_red:1549131045876793545>";
@@ -4737,6 +4768,9 @@ export async function startRazeBot() {
   botStarted = true;
 
   if (!token) {
+    diagnostics.phase = "login-failed";
+    diagnostics.lastError = "DISCORD_BOT_TOKEN is missing";
+    diagnostics.hint = "Add DISCORD_BOT_TOKEN in Render -> Environment, then redeploy.";
     throw new Error(
       `DISCORD_BOT_TOKEN is missing. Add it to the project secrets before starting ${botName()}.`,
     );
@@ -4756,6 +4790,7 @@ export async function startRazeBot() {
   await initExtras(client);
 
   client.on(Events.Error, (error) => {
+    recordError(error);
     logger.error({ err: error }, "ZAIR Discord client error");
   });
 
@@ -4765,6 +4800,9 @@ export async function startRazeBot() {
 
   client.on(Events.ShardDisconnect, (event, shardId) => {
     botReady = false;
+    diagnostics.phase = "disconnected";
+    diagnostics.lastDisconnectCode = event.code;
+    diagnostics.hint = hintFor(event.code) ?? diagnostics.hint;
     logger.warn(
       { code: event.code, shardId },
       "ZAIR gateway disconnected; discord.js will reconnect automatically",
@@ -4777,15 +4815,19 @@ export async function startRazeBot() {
 
   client.on(Events.ShardReady, (shardId) => {
     botReady = true;
+    diagnostics.phase = "ready";
     logger.info({ shardId }, "ZAIR gateway shard ready");
   });
 
   client.on(Events.ShardResume, (shardId, replayedEvents) => {
     botReady = true;
+    diagnostics.phase = "ready";
+    diagnostics.lastError = null;
     logger.info({ shardId, replayedEvents }, "ZAIR gateway session resumed");
   });
 
   client.on(Events.ShardError, (error, shardId) => {
+    recordError(error);
     logger.error({ err: error, shardId }, "ZAIR gateway shard error");
   });
 
@@ -5181,7 +5223,25 @@ export async function startRazeBot() {
     }
   }));
 
-  logger.info("ZAIR connecting to the Discord gateway");
-  await client.login(token);
-  logger.info("ZAIR gateway login accepted");
+  logger.info(
+    { tokenLength: token.length, intents: "Guilds, GuildMessages, GuildMembers, MessageContent, GuildInvites" },
+    "ZAIR connecting to the Discord gateway",
+  );
+  diagnostics.phase = "logging-in";
+  const pendingWarning = setTimeout(() => {
+    logger.warn(
+      "ZAIR login has been pending for 45s. If this continues, Discord may be rate limiting this Render IP (HTTP 429 / Cloudflare 1015).",
+    );
+  }, 45_000);
+  try {
+    await client.login(token);
+    diagnostics.phase = "waiting-for-ready";
+    logger.info("ZAIR gateway login accepted; waiting for the ready event");
+  } catch (error) {
+    diagnostics.phase = "login-failed";
+    recordError(error);
+    throw error;
+  } finally {
+    clearTimeout(pendingWarning);
+  }
 }

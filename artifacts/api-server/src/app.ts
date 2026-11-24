@@ -10,6 +10,10 @@ const app: Express = express();
 app.use(
   pinoHttp({
     logger,
+    autoLogging: {
+      ignore: (req) =>
+        ["/", "/ping", "/status"].includes(req.url?.split("?")[0] ?? ""),
+    },
     serializers: {
       req(req) {
         return {
