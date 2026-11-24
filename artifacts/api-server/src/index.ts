@@ -44,22 +44,27 @@ void startRazeBot().catch((error) => {
 });
 
 // Watchdog: the website can stay "live" while the Discord gateway is dead.
-// If the bot is not connected for 3 minutes straight, exit so Render restarts
-// the service and logs in again. This is a real restart, not a fake status.
-const notReadyLimitMs = 3 * 60_000;
+// If the bot is not connected for 10 minutes straight, exit so Render restarts
+// the service and logs in again. While Discord itself is rate limiting us we
+// do NOT restart (each restart only makes the rate limit worse); we wait.
+const notReadyLimitMs = 10 * 60_000;
 let notReadySince: number | null = Date.now();
 setInterval(() => {
   if (shuttingDown) {
     return;
   }
-  if (getBotStatus().ready) {
+  const status = getBotStatus();
+  if (status.ready) {
     notReadySince = null;
     return;
   }
   notReadySince ??= Date.now();
+  if (Date.now() < status.rateLimitedUntil + 60_000) {
+    return;
+  }
   if (Date.now() - notReadySince > notReadyLimitMs) {
     logger.fatal(
-      "ZAIR has not been connected to Discord for 3 minutes; exiting so Render restarts it",
+      "ZAIR has not been connected to Discord for 10 minutes; exiting so Render restarts it",
     );
     process.exit(1);
   }

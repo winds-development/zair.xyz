@@ -52,7 +52,43 @@ const diagnostics: {
   lastError: string | null;
   lastDisconnectCode: number | null;
   hint: string | null;
-} = { phase: "starting", lastError: null, lastDisconnectCode: null, hint: null };
+  apiProbe: string | null;
+  rateLimit: string | null;
+  rateLimitedUntil: number;
+} = {
+  phase: "starting",
+  lastError: null,
+  lastDisconnectCode: null,
+  hint: null,
+  apiProbe: null,
+  rateLimit: null,
+  rateLimitedUntil: 0,
+};
+
+// Real connectivity check against Discord's public API from this host's IP.
+async function probeDiscordApi() {
+  try {
+    const response = await fetch("https://discord.com/api/v10/gateway", {
+      signal: AbortSignal.timeout(10_000),
+    });
+    diagnostics.apiProbe = `HTTP ${response.status}`;
+    if (response.status === 429 || response.status === 403) {
+      diagnostics.hint =
+        "Discord's API is blocking or rate limiting this Render IP (HTTP " +
+        response.status +
+        "). Redeploying will not help. Wait 15-60 minutes, move the Render service to another region, or host the bot on a VPS.";
+      logger.warn(
+        { status: response.status, retryAfter: response.headers.get("retry-after") },
+        "Discord API probe: this host looks blocked / rate limited",
+      );
+    } else {
+      logger.info({ status: response.status }, "Discord API probe OK (this host can reach Discord)");
+    }
+  } catch (error) {
+    diagnostics.apiProbe = `unreachable: ${error instanceof Error ? error.message : String(error)}`;
+    logger.warn({ err: error }, "Discord API probe failed (cannot reach discord.com)");
+  }
+}
 
 function hintFor(codeOrMessage: number | string | null): string | null {
   const text = String(codeOrMessage ?? "").toLowerCase();
@@ -85,6 +121,9 @@ export function getBotStatus() {
     lastError: diagnostics.lastError,
     lastDisconnectCode: diagnostics.lastDisconnectCode,
     hint: diagnostics.hint,
+    apiProbe: diagnostics.apiProbe,
+    rateLimit: diagnostics.rateLimit,
+    rateLimitedUntil: diagnostics.rateLimitedUntil,
   };
 }
 
@@ -5228,6 +5267,22 @@ export async function startRazeBot() {
     "ZAIR connecting to the Discord gateway",
   );
   diagnostics.phase = "logging-in";
+  void probeDiscordApi();
+  client.rest.on("rateLimited", (info) => {
+    diagnostics.rateLimitedUntil = Date.now() + info.timeToReset;
+    diagnostics.rateLimit = `${info.method} ${info.route} must wait ${Math.ceil(info.timeToReset / 1000)}s (global: ${info.global})`;
+    diagnostics.hint =
+      hintFor("429") ?? diagnostics.hint;
+    logger.warn(
+      {
+        method: info.method,
+        route: info.route,
+        waitSeconds: Math.ceil(info.timeToReset / 1000),
+        global: info.global,
+      },
+      "Discord REST rate limit hit; discord.js is waiting before retrying",
+    );
+  });
   const pendingWarning = setTimeout(() => {
     logger.warn(
       "ZAIR login has been pending for 45s. If this continues, Discord may be rate limiting this Render IP (HTTP 429 / Cloudflare 1015).",
