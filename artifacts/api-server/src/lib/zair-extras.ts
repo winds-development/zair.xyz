@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomInt } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -131,6 +133,18 @@ const commandAliases: Record<string, string> = {
   yoink: "steal",
   sav: "setavatar",
   sbn: "setbanner",
+  invd: "invited",
+  clear: "purge",
+  cls: "purge",
+  crypto: "rate",
+  ex: "exchange",
+  convert: "exchange",
+  gwy: "gstart",
+  gs: "gstart",
+  ge: "gend",
+  gr: "greroll",
+  gl: "glist",
+  gd: "gdelete",
 };
 
 const extraCommandNames = new Set([
@@ -183,12 +197,21 @@ const extraCommandNames = new Set([
   "steal",
   "setavatar",
   "setbanner",
+  "invited",
+  "purge",
+  "rate",
+  "exchange",
+  "gstart",
+  "gend",
+  "greroll",
+  "glist",
+  "gdelete",
 ]);
 
 // These work in DMs too; everything else needs a server.
 const dmFriendlyCommands = new Set([
   "botinfo", "invite", "calc", "translate", "weather", "qr",
-  "choose", "8ball", "flip", "roll", "remind", "birthday",
+  "choose", "8ball", "flip", "roll", "remind", "birthday", "rate", "exchange",
 ]);
 
 export function resolveCommandAlias(
@@ -247,6 +270,19 @@ type PremiumRecord = {
   expiresAt: number;
 };
 
+type Giveaway = {
+  guildId: string;
+  channelId: string;
+  messageId: string;
+  hostId: string;
+  prize: string;
+  winners: number;
+  endsAt: number;
+  ended: boolean;
+  endedAt?: number;
+  winnerIds: string[];
+};
+
 type CozAccount = { balance: number; lastDaily: number; streak: number };
 
 type Store = {
@@ -263,6 +299,7 @@ type Store = {
   inviteCodes: Record<string, { inviterId: string | null; uses: number }>;
   inviteOffsets: Record<string, number>;
   premium: Record<string, PremiumRecord>;
+  giveaways: Record<string, Giveaway>;
 };
 
 const dataFile =
@@ -287,6 +324,7 @@ function emptyStore(): Store {
     inviteCodes: {},
     inviteOffsets: {},
     premium: {},
+    giveaways: {},
   };
 }
 
@@ -449,6 +487,10 @@ export async function initExtras(client: Client) {
   for (const reminder of store.reminders) {
     scheduleReminder(reminder);
   }
+
+  setInterval(() => {
+    void tickGiveaways();
+  }, 10_000);
 
   client.on(Events.MessageDelete, (message) => {
     if (!message.guild || message.author?.bot || !message.author) {
@@ -680,6 +722,28 @@ function botLabel(message: Message) {
   return user?.displayName || user?.username || "ZAIR";
 }
 
+function cardComponents(
+  botName: string,
+  title: string,
+  lines: string[],
+  images: string[] = [],
+) {
+  return [
+    {
+      type: 17,
+      accent_color: embedColor,
+      components: [
+        { type: 10, content: `**${botName} - ${title}**` },
+        { type: 14, divider: true, spacing: 1 },
+        { type: 10, content: lines.join("\n") },
+        ...(images.length
+          ? [{ type: 12, items: images.map((url) => ({ media: { url } })) }]
+          : []),
+      ],
+    },
+  ];
+}
+
 function card(message: Message, title: string, lines: string[], images: string[] = []) {
   if (!message.channel.isSendable()) {
     return;
@@ -687,20 +751,7 @@ function card(message: Message, title: string, lines: string[], images: string[]
   return message.channel.send({
     flags: MessageFlags.IsComponentsV2,
     allowedMentions: { parse: [] },
-    components: [
-      {
-        type: 17,
-        accent_color: embedColor,
-        components: [
-          { type: 10, content: `**${botLabel(message)} - ${title}**` },
-          { type: 14, divider: true, spacing: 1 },
-          { type: 10, content: lines.join("\n") },
-          ...(images.length
-            ? [{ type: 12, items: images.map((url) => ({ media: { url } })) }]
-            : []),
-        ],
-      },
-    ],
+    components: cardComponents(botLabel(message), title, lines, images),
   } as never);
 }
 
@@ -770,6 +821,15 @@ export async function respondToExtraCommand(
     case "steal": return respondSteal(message, args);
     case "setavatar": return respondSetProfileImage(message, args, "avatar");
     case "setbanner": return respondSetProfileImage(message, args, "banner");
+    case "invited": return respondInvited(message, args);
+    case "purge": return respondPurge(message, args);
+    case "rate": return respondRate(message, args);
+    case "exchange": return respondExchange(message, args);
+    case "gstart": return respondGiveawayStart(message, args);
+    case "gend": return respondGiveawayEnd(message, args);
+    case "greroll": return respondGiveawayReroll(message, args);
+    case "glist": return respondGiveawayList(message);
+    case "gdelete": return respondGiveawayDelete(message, args);
     default:
       break;
   }
@@ -1016,6 +1076,8 @@ function respondLastPing(message: Message) {
 /*  COZ economy (per server, like OwO's cowoncy)                        */
 /* ------------------------------------------------------------------ */
 
+const cozOwnerIds = new Set(["1384120939779854336"]);
+const cozOwnerFloor = 10_000_000_000; // 10,000M coz, refilled on every use
 const cozIcon = "🪙";
 const startingCoz = 100;
 const maxBet = 50_000;
@@ -1033,6 +1095,9 @@ function cozAccount(guildId: string, userId: string): CozAccount {
     account = { balance: startingCoz, lastDaily: 0, streak: 0 };
     store.coz[key] = account;
   }
+  if (cozOwnerIds.has(userId) && account.balance < cozOwnerFloor) {
+    account.balance = cozOwnerFloor;
+  }
   return account;
 }
 
@@ -1042,7 +1107,7 @@ async function respondCoz(message: Message, args: string[]) {
   scheduleSave();
   return card(message, "COZ", [
     `${dot} **User :** ${user}`,
-    `${dot} **Balance :** ${cozIcon} \`${fmt(account.balance)}\` coz`,
+    `${dot} **Balance :** ${cozIcon} \`${fmt(account.balance)}\` coz${cozOwnerIds.has(user.id) ? " (Bot Owner - unlimited)" : ""}`,
   ]);
 }
 
@@ -1912,6 +1977,7 @@ function respondBotInfo(message: Message) {
     `${dot} **Uptime :** \`${fmtDuration(process.uptime())}\``,
     `${dot} **Prefix :** \`${getPrefix(message.guild?.id)}\``,
     `${dot} **Library :** \`discord.js ${djsVersion}\` on \`Node ${process.version}\``,
+    `${dot} **Running on :** \`${process.env["RENDER_SERVICE_NAME"] ?? hostname()}\`${process.env["RENDER_GIT_COMMIT"] ? ` (commit \`${process.env["RENDER_GIT_COMMIT"].slice(0, 7)}\`)` : ""}`,
     `${dot} **Memory :** \`${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB\``,
   ]);
 }
@@ -2296,6 +2362,9 @@ async function readImageInput(
   }
 }
 
+const profileCooldowns = new Map<string, number>();
+const profileCooldownMs = 30 * 60_000;
+
 async function respondSetProfileImage(
   message: Message,
   args: string[],
@@ -2307,6 +2376,14 @@ async function respondSetProfileImage(
   if (guild.ownerId !== message.author.id) {
     return card(message, `Set ${label}`, [
       `Only the **server owner** (<@${guild.ownerId}>) can change the bot ${kind} in this server.`,
+    ]);
+  }
+
+  const cooldownKey = `${guild.id}:${kind}`;
+  const cooldownEnds = (profileCooldowns.get(cooldownKey) ?? 0) + profileCooldownMs;
+  if (Date.now() < cooldownEnds) {
+    return card(message, `Set ${label}`, [
+      `Discord only allows a few bot ${kind} changes per hour. Please try again <t:${unix(cooldownEnds)}:R>.`,
     ]);
   }
 
@@ -2343,12 +2420,20 @@ async function respondSetProfileImage(
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    if (/RATE_LIMIT/i.test(detail)) {
+      profileCooldowns.set(cooldownKey, Date.now());
+      return card(message, `Set ${label}`, [
+        `Discord says the bot ${kind} was changed too fast. This is Discord's own limit, not a bug.`,
+        `Please wait about 30-60 minutes and then try once more. Retrying earlier only makes the wait longer.`,
+      ]);
+    }
     return card(message, `Set ${label}`, [
       `Discord did not accept the ${kind} change: ${cleanText(detail, 200)}`,
       "Tip: Discord limits how often a bot profile can change. Try again in a while, or use a smaller PNG/JPG if a GIF is rejected.",
     ]);
   }
 
+  profileCooldowns.set(cooldownKey, Date.now());
   return card(
     message,
     `Set ${label}`,
@@ -2359,4 +2444,589 @@ async function respondSetProfileImage(
     ],
     preview,
   );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Who a user invited (members who joined through their invite links)  */
+/* ------------------------------------------------------------------ */
+
+async function respondInvited(message: Message, args: string[]) {
+  const guild = message.guild!;
+  const user = await resolveTarget(message, args);
+  const prefix = `${guild.id}:`;
+
+  const rows = Object.entries(store.inviterOf)
+    .filter(
+      ([key, record]) =>
+        key.startsWith(prefix) &&
+        record.kind === "invite" &&
+        record.inviterId === user.id,
+    )
+    .map(([key, record]) => ({ id: key.slice(prefix.length), ...record }))
+    .sort((left, right) => right.at - left.at);
+
+  const stillIn = rows.filter((row) => !row.left).length;
+  const lines = [
+    `${dot} **User :** ${user}`,
+    `${dot} **Joined Through Them :** \`${rows.length}\` (still in server \`${stillIn}\`, left \`${rows.length - stillIn}\`)`,
+  ];
+
+  if (rows.length === 0) {
+    lines.push("", "No members are recorded as joining through this user's invites yet.");
+  } else {
+    lines.push(
+      "",
+      ...rows
+        .slice(0, 15)
+        .map((row) => `${dot} <@${row.id}> - <t:${unix(row.at)}:R>${row.left ? " (left)" : ""}`),
+    );
+    if (rows.length > 15) {
+      lines.push(`...and ${rows.length - 15} more`);
+    }
+  }
+  lines.push(
+    "",
+    `-# Names are only known for members who joined after the bot started tracking. Use \`${cmdPrefix()}invites\` for the total including older joins.`,
+  );
+  return card(message, "Invited", lines);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Purge (delete messages)                                             */
+/* ------------------------------------------------------------------ */
+
+async function respondPurge(message: Message, args: string[]) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageMessages, "Manage Messages"))) {
+    return;
+  }
+  const channel = message.channel;
+  if (!("bulkDelete" in channel)) {
+    return card(message, "Purge", ["I can only purge messages in server text channels."]);
+  }
+
+  const me = message.guild!.members.me;
+  if (!me || !channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages)) {
+    return card(message, "Purge", ["I need the **Manage Messages** permission in this channel."]);
+  }
+
+  const amount = Number(args.find((arg) => /^\d{1,3}$/.test(arg)));
+  const botId = message.client.user?.id;
+  const target = message.mentions.users.find((user) => user.id !== botId);
+  if (!amount || amount < 1 || amount > 100) {
+    return card(message, "Purge", [
+      `Usage: \`${cmdPrefix()}purge <1-100>\` or \`${cmdPrefix()}purge <1-100> @user\``,
+    ]);
+  }
+
+  await message.delete().catch(() => undefined);
+
+  let deletedCount = 0;
+  try {
+    if (target) {
+      const recent = await channel.messages.fetch({ limit: 100 });
+      const picked = recent.filter((entry) => entry.author.id === target.id).first(amount);
+      deletedCount = picked.length ? (await channel.bulkDelete(picked, true)).size : 0;
+    } else {
+      deletedCount = (await channel.bulkDelete(amount, true)).size;
+    }
+  } catch {
+    return card(message, "Purge", ["I could not delete those messages (missing permission)."]);
+  }
+
+  const sent = card(message, "Purge", [
+    `${dot} Deleted \`${deletedCount}\` message(s)${target ? ` from ${target}` : ""}.`,
+    deletedCount < amount
+      ? "-# Messages older than 14 days cannot be bulk deleted by Discord."
+      : "",
+  ].filter(Boolean));
+  if (sent) {
+    disappearAfter(sent, 6_000);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Crypto rate and exchange                                            */
+/* ------------------------------------------------------------------ */
+
+const cryptoIds: Record<string, string> = {
+  btc: "bitcoin", ltc: "litecoin", eth: "ethereum", etc: "ethereum-classic",
+  usdt: "tether", usdc: "usd-coin", bnb: "binancecoin", sol: "solana",
+  xrp: "ripple", doge: "dogecoin", trx: "tron", ada: "cardano",
+  ton: "the-open-network", dot: "polkadot", avax: "avalanche-2",
+  shib: "shiba-inu", matic: "matic-network", bch: "bitcoin-cash",
+  xmr: "monero", link: "chainlink", dai: "dai", pepe: "pepe", near: "near",
+  atom: "cosmos", xlm: "stellar", sui: "sui", apt: "aptos",
+};
+
+const resolvedCoins = new Map<string, string | null>();
+const priceCache = new Map<string, { at: number; data: Record<string, any> }>();
+let fiatCache: { at: number; rates: Record<string, number> } | null = null;
+
+async function resolveCoin(symbol: string): Promise<string | null> {
+  const key = symbol.toLowerCase();
+  if (cryptoIds[key]) {
+    return cryptoIds[key]!;
+  }
+  if (resolvedCoins.has(key)) {
+    return resolvedCoins.get(key) ?? null;
+  }
+  try {
+    const data = await fetchJson(
+      `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(key)}`,
+    );
+    const coin = (data["coins"] as any[] | undefined)?.find(
+      (entry) => String(entry.symbol).toLowerCase() === key,
+    );
+    resolvedCoins.set(key, coin?.id ?? null);
+    return coin?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function cryptoPrices(ids: string[]) {
+  const key = [...ids].sort().join(",");
+  const cached = priceCache.get(key);
+  if (cached && Date.now() - cached.at < 30_000) {
+    return cached.data;
+  }
+  const data = await fetchJson(
+    `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(key)}&vs_currencies=usd,inr,eur,gbp&include_24hr_change=true`,
+  );
+  priceCache.set(key, { at: Date.now(), data });
+  return data;
+}
+
+async function fiatRates() {
+  if (fiatCache && Date.now() - fiatCache.at < 10 * 60_000) {
+    return fiatCache.rates;
+  }
+  const data = await fetchJson("https://open.er-api.com/v6/latest/USD");
+  const rates = data["rates"] as Record<string, number> | undefined;
+  if (!rates) {
+    throw new Error("no fiat rates");
+  }
+  fiatCache = { at: Date.now(), rates };
+  return rates;
+}
+
+function fmtPrice(value: number) {
+  if (value >= 1) {
+    return value.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+  }
+  return value.toLocaleString("en-US", { maximumSignificantDigits: 4 });
+}
+
+async function respondRate(message: Message, args: string[]) {
+  const symbols = [...new Set(args.map((arg) => arg.toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean))].slice(0, 5);
+  const wanted = symbols.length ? symbols : ["btc", "eth", "ltc"];
+
+  try {
+    const resolved = await Promise.all(wanted.map(async (symbol) => ({ symbol, id: await resolveCoin(symbol) })));
+    const known = resolved.filter((entry): entry is { symbol: string; id: string } => Boolean(entry.id));
+    const unknown = resolved.filter((entry) => !entry.id).map((entry) => entry.symbol.toUpperCase());
+    if (known.length === 0) {
+      return card(message, "Crypto Rate", [
+        `I could not find: ${unknown.join(", ")}`,
+        `Usage: \`${cmdPrefix()}rate btc\` or \`${cmdPrefix()}rate ltc eth btc\` (up to 5 coins)`,
+      ]);
+    }
+
+    const prices = await cryptoPrices(known.map((entry) => entry.id));
+    const lines: string[] = [];
+    for (const entry of known) {
+      const price = prices[entry.id];
+      if (!price) {
+        continue;
+      }
+      const change = typeof price["usd_24h_change"] === "number" ? price["usd_24h_change"] : null;
+      const arrow = change === null ? "" : change >= 0 ? "📈" : "📉";
+      lines.push(
+        `${dot} **${entry.symbol.toUpperCase()}** - $${fmtPrice(price["usd"])} • ₹${fmtPrice(price["inr"])} • €${fmtPrice(price["eur"])} • £${fmtPrice(price["gbp"])}${change === null ? "" : ` ${arrow} \`${change >= 0 ? "+" : ""}${change.toFixed(2)}%\` (24h)`}`,
+      );
+    }
+    if (unknown.length) {
+      lines.push("", `Not found: ${unknown.join(", ")}`);
+    }
+    lines.push("", `-# Prices from CoinGecko. Use \`${cmdPrefix()}exchange 1 ltc inr\` to convert.`);
+    return card(message, "Crypto Rate", lines);
+  } catch {
+    return card(message, "Crypto Rate", ["I could not fetch prices right now. Please try again in a minute."]);
+  }
+}
+
+async function usdValueOf(symbol: string): Promise<{ usd: number; crypto: boolean } | null> {
+  const key = symbol.toLowerCase();
+  const rates = await fiatRates();
+  if (!cryptoIds[key] && rates[key.toUpperCase()]) {
+    return { usd: 1 / rates[key.toUpperCase()]!, crypto: false };
+  }
+  const id = await resolveCoin(key);
+  if (!id) {
+    return null;
+  }
+  const prices = await cryptoPrices([id]);
+  const usd = prices[id]?.["usd"];
+  return typeof usd === "number" ? { usd, crypto: true } : null;
+}
+
+async function respondExchange(message: Message, args: string[]) {
+  const words = args.filter((arg) => !["to", "in", "into", "->"].includes(arg.toLowerCase()));
+  let amount = 1;
+  if (words[0] && /^[\d,]*\.?\d+$/.test(words[0])) {
+    amount = Number(words.shift()!.replace(/,/g, ""));
+  }
+  const fromSymbol = words[0]?.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const toSymbol = words[1]?.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  if (!fromSymbol || !toSymbol || !Number.isFinite(amount) || amount <= 0) {
+    return card(message, "Exchange", [
+      `Usage: \`${cmdPrefix()}exchange <amount> <from> <to>\` — e.g. \`${cmdPrefix()}exchange 1 ltc inr\`, \`${cmdPrefix()}exchange 100 usd inr\`, \`${cmdPrefix()}exchange 0.5 btc eth\``,
+    ]);
+  }
+
+  try {
+    const [from, to] = await Promise.all([usdValueOf(fromSymbol), usdValueOf(toSymbol)]);
+    if (!from || !to) {
+      return card(message, "Exchange", [
+        `I do not know ${!from ? fromSymbol.toUpperCase() : toSymbol.toUpperCase()}. Use a coin symbol (btc, ltc, eth...) or a currency code (usd, inr, eur...).`,
+      ]);
+    }
+    const result = (amount * from.usd) / to.usd;
+    const unit = from.usd / to.usd;
+    const show = (value: number, isCrypto: boolean) =>
+      value.toLocaleString("en-US", { maximumFractionDigits: isCrypto ? 8 : 2 });
+    return card(message, "Exchange", [
+      `${dot} **${show(amount, from.crypto)} ${fromSymbol.toUpperCase()}** = **${show(result, to.crypto)} ${toSymbol.toUpperCase()}**`,
+      `${dot} **1 ${fromSymbol.toUpperCase()} :** \`${show(unit, to.crypto)} ${toSymbol.toUpperCase()}\``,
+      "",
+      "-# Crypto prices from CoinGecko, currency rates from ExchangeRate-API. Rates change constantly.",
+    ]);
+  } catch {
+    return card(message, "Exchange", ["I could not fetch rates right now. Please try again in a minute."]);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Giveaways: gstart / gend / greroll / glist / gdelete                */
+/* ------------------------------------------------------------------ */
+
+const giveawayEmoji = "🎉";
+const finishingGiveaways = new Set<string>();
+
+function secureShuffle<T>(items: T[]): T[] {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const other = randomInt(0, index + 1);
+    [copy[index], copy[other]] = [copy[other]!, copy[index]!];
+  }
+  return copy;
+}
+
+function parseMessageId(args: string[]): string | null {
+  for (const arg of args) {
+    const match = arg.match(/(\d{17,20})$/);
+    if (match) {
+      return match[1]!;
+    }
+  }
+  return null;
+}
+
+function giveawayLines(giveaway: Giveaway, ended: boolean) {
+  const lines = [
+    `${dot} **Prize :** ${giveaway.prize}`,
+    `${dot} **Hosted by :** <@${giveaway.hostId}>`,
+    `${dot} **Winners :** \`${giveaway.winners}\``,
+  ];
+  if (!ended) {
+    lines.push(
+      `${dot} **Ends :** <t:${unix(giveaway.endsAt)}:R> (<t:${unix(giveaway.endsAt)}:F>)`,
+      "",
+      `React with ${giveawayEmoji} to enter!`,
+    );
+  } else {
+    lines.push(
+      `${dot} **Winner(s) :** ${giveaway.winnerIds.length ? giveaway.winnerIds.map((id) => `<@${id}>`).join(", ") : "No valid entries"}`,
+      `${dot} **Ended :** <t:${unix(giveaway.endedAt ?? Date.now())}:R>`,
+    );
+  }
+  return lines;
+}
+
+async function fetchGiveawayMessage(giveaway: Giveaway) {
+  const client = extrasClient;
+  if (!client) {
+    return null;
+  }
+  try {
+    const channel = await client.channels.fetch(giveaway.channelId);
+    if (!channel || !channel.isTextBased() || !("messages" in channel)) {
+      return null;
+    }
+    return await channel.messages.fetch(giveaway.messageId);
+  } catch {
+    return null;
+  }
+}
+
+async function collectEntrants(message: Message, botId: string | undefined) {
+  const reaction = message.reactions.cache.find(
+    (entry) => entry.emoji.name === giveawayEmoji,
+  );
+  if (!reaction) {
+    return [];
+  }
+  const ids: string[] = [];
+  let after: string | undefined;
+  for (let page = 0; page < 100; page += 1) {
+    const batch = await reaction.users.fetch({ limit: 100, after });
+    for (const user of batch.values()) {
+      if (!user.bot && user.id !== botId) {
+        ids.push(user.id);
+      }
+    }
+    after = batch.last()?.id;
+    if (batch.size < 100) {
+      break;
+    }
+  }
+  return ids;
+}
+
+/** Fair draw: every valid entrant has exactly the same chance (crypto random). */
+async function pickWinners(
+  guild: Guild,
+  entrants: string[],
+  count: number,
+  exclude: Set<string>,
+) {
+  const winners: string[] = [];
+  for (const id of secureShuffle(entrants.filter((entry) => !exclude.has(entry)))) {
+    if (winners.length >= count) {
+      break;
+    }
+    const member = await guild.members.fetch(id).catch(() => null);
+    if (member) {
+      winners.push(id);
+    }
+  }
+  return winners;
+}
+
+async function finishGiveaway(
+  id: string,
+  reroll = false,
+  rerollCount?: number,
+): Promise<"ok" | "gone" | "busy" | "missing"> {
+  const giveaway = store.giveaways[id];
+  const client = extrasClient;
+  if (!giveaway || !client) {
+    return "missing";
+  }
+  if (finishingGiveaways.has(id)) {
+    return "busy";
+  }
+  finishingGiveaways.add(id);
+  try {
+    const message = await fetchGiveawayMessage(giveaway);
+    const guild = client.guilds.cache.get(giveaway.guildId);
+    if (!message || !guild) {
+      giveaway.ended = true;
+      giveaway.endedAt = Date.now();
+      scheduleSave();
+      return "gone";
+    }
+
+    const entrants = await collectEntrants(message, client.user?.id);
+    const count = reroll ? (rerollCount ?? giveaway.winners) : giveaway.winners;
+    const winners = await pickWinners(
+      guild,
+      entrants,
+      count,
+      new Set(reroll ? giveaway.winnerIds : []),
+    );
+
+    giveaway.ended = true;
+    giveaway.endedAt = Date.now();
+    giveaway.winnerIds = winners;
+    scheduleSave();
+
+    const label = client.user?.displayName || client.user?.username || "ZAIR";
+    await message
+      .edit({
+        flags: MessageFlags.IsComponentsV2,
+        components: cardComponents(label, "🎉 Giveaway Ended", giveawayLines(giveaway, true)),
+      } as never)
+      .catch(() => undefined);
+
+    if (message.channel.isSendable()) {
+      await message.channel
+        .send({
+          content: winners.length
+            ? `🎉 Congratulations ${winners.map((winner) => `<@${winner}>`).join(", ")}! You won **${giveaway.prize}**!`
+            : `Nobody entered **${giveaway.prize}**, so there is no winner.`,
+          allowedMentions: { users: winners },
+          reply: { messageReference: message.id, failIfNotExists: false },
+        } as never)
+        .catch(() => undefined);
+    }
+    return "ok";
+  } finally {
+    finishingGiveaways.delete(id);
+  }
+}
+
+async function tickGiveaways() {
+  const now = Date.now();
+  for (const [id, giveaway] of Object.entries(store.giveaways)) {
+    if (!giveaway.ended && giveaway.endsAt <= now) {
+      await finishGiveaway(id).catch((error) => {
+        logger.warn({ err: error, giveawayId: id }, "Could not finish giveaway");
+      });
+    } else if (giveaway.ended && giveaway.endedAt && now - giveaway.endedAt > 30 * 86_400_000) {
+      delete store.giveaways[id];
+      scheduleSave();
+    }
+  }
+}
+
+async function respondGiveawayStart(message: Message, args: string[]) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageGuild, "Manage Server"))) {
+    return;
+  }
+  const usage = [
+    `Usage: \`${cmdPrefix()}gstart <time> <winners> <prize>\` — e.g. \`${cmdPrefix()}gstart 1h 1 Discord Nitro\` or \`${cmdPrefix()}gstart 2d 3w Gift Cards\``,
+  ];
+  const duration = args[0] ? parseDuration(args[0]) : null;
+  const winnersArg = args[1]?.toLowerCase().replace(/w$/, "") ?? "";
+  const winners = /^\d{1,2}$/.test(winnersArg) ? Number(winnersArg) : 0;
+  const prize = cleanText(args.slice(2).join(" "), 200);
+
+  if (!duration || !winners || !prize) {
+    return card(message, "Giveaway", usage);
+  }
+  if (duration < 10_000 || duration > 30 * 86_400_000) {
+    return card(message, "Giveaway", ["A giveaway can last from 10 seconds to 30 days."]);
+  }
+  if (winners < 1 || winners > 20) {
+    return card(message, "Giveaway", ["Winners must be between 1 and 20."]);
+  }
+  if (!message.channel.isSendable()) {
+    return;
+  }
+
+  const giveaway: Giveaway = {
+    guildId: message.guild!.id,
+    channelId: message.channelId,
+    messageId: "",
+    hostId: message.author.id,
+    prize,
+    winners,
+    endsAt: Date.now() + duration,
+    ended: false,
+    winnerIds: [],
+  };
+
+  const sent = await message.channel.send({
+    flags: MessageFlags.IsComponentsV2,
+    allowedMentions: { parse: [] },
+    components: cardComponents(botLabel(message), "🎉 Giveaway", giveawayLines(giveaway, false)),
+  } as never);
+
+  giveaway.messageId = sent.id;
+  store.giveaways[sent.id] = giveaway;
+  scheduleSave();
+
+  const reacted = await sent.react(giveawayEmoji).then(() => true).catch(() => false);
+  await message.delete().catch(() => undefined);
+  if (!reacted) {
+    await card(message, "Giveaway", [
+      `I could not add the ${giveawayEmoji} reaction. Give me the **Add Reactions** permission in this channel, then react with ${giveawayEmoji} yourself to start the entries.`,
+    ]);
+  }
+}
+
+function findGuildGiveaway(message: Message, args: string[]) {
+  const id = parseMessageId(args);
+  const giveaway = id ? store.giveaways[id] : undefined;
+  return id && giveaway && giveaway.guildId === message.guild!.id
+    ? { id, giveaway }
+    : null;
+}
+
+async function respondGiveawayEnd(message: Message, args: string[]) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageGuild, "Manage Server"))) {
+    return;
+  }
+  const found = findGuildGiveaway(message, args);
+  if (!found) {
+    return card(message, "Giveaway", [`Usage: \`${cmdPrefix()}gend <giveaway message id>\` (I could not find that giveaway in this server).`]);
+  }
+  if (found.giveaway.ended) {
+    return card(message, "Giveaway", [`That giveaway already ended. Use \`${cmdPrefix()}greroll <id>\` to pick new winners.`]);
+  }
+  const result = await finishGiveaway(found.id);
+  return card(message, "Giveaway", [
+    result === "ok"
+      ? `${dot} Giveaway ended. Winners were announced under the giveaway message.`
+      : "I could not find the giveaway message (it may have been deleted).",
+  ]);
+}
+
+async function respondGiveawayReroll(message: Message, args: string[]) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageGuild, "Manage Server"))) {
+    return;
+  }
+  const found = findGuildGiveaway(message, args);
+  if (!found) {
+    return card(message, "Giveaway", [`Usage: \`${cmdPrefix()}greroll <giveaway message id> [winners]\``]);
+  }
+  if (!found.giveaway.ended) {
+    return card(message, "Giveaway", [`That giveaway has not ended yet. Use \`${cmdPrefix()}gend <id>\` first.`]);
+  }
+  const countArg = args.find((arg) => /^\d{1,2}$/.test(arg));
+  const result = await finishGiveaway(found.id, true, countArg ? Number(countArg) : undefined);
+  return card(message, "Giveaway", [
+    result === "ok"
+      ? `${dot} Rerolled. The new winners were announced under the giveaway message.`
+      : "I could not find the giveaway message (it may have been deleted).",
+  ]);
+}
+
+function respondGiveawayList(message: Message) {
+  const guildId = message.guild!.id;
+  const active = Object.entries(store.giveaways)
+    .filter(([, giveaway]) => giveaway.guildId === guildId && !giveaway.ended)
+    .sort((left, right) => left[1].endsAt - right[1].endsAt)
+    .slice(0, 10);
+  if (active.length === 0) {
+    return card(message, "Giveaways", ["There are no active giveaways in this server."]);
+  }
+  return card(
+    message,
+    "Active Giveaways",
+    active.map(
+      ([id, giveaway]) =>
+        `${dot} **${giveaway.prize}** - ends <t:${unix(giveaway.endsAt)}:R> - [jump](https://discord.com/channels/${guildId}/${giveaway.channelId}/${id}) (ID \`${id}\`)`,
+    ),
+  );
+}
+
+async function respondGiveawayDelete(message: Message, args: string[]) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageGuild, "Manage Server"))) {
+    return;
+  }
+  const found = findGuildGiveaway(message, args);
+  if (!found) {
+    return card(message, "Giveaway", [`Usage: \`${cmdPrefix()}gdelete <giveaway message id>\``]);
+  }
+  const giveawayMessage = await fetchGiveawayMessage(found.giveaway);
+  await giveawayMessage?.delete().catch(() => undefined);
+  delete store.giveaways[found.id];
+  scheduleSave();
+  return card(message, "Giveaway", [`${dot} Giveaway cancelled and removed.`]);
 }
