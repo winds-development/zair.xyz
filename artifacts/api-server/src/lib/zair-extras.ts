@@ -145,6 +145,8 @@ const commandAliases: Record<string, string> = {
   gr: "greroll",
   gl: "glist",
   gd: "gdelete",
+  ai: "addinvites",
+  amsg: "addmessages",
 };
 
 const extraCommandNames = new Set([
@@ -206,6 +208,8 @@ const extraCommandNames = new Set([
   "greroll",
   "glist",
   "gdelete",
+  "addinvites",
+  "addmessages",
 ]);
 
 // These work in DMs too; everything else needs a server.
@@ -298,6 +302,7 @@ type Store = {
   reminders: Reminder[];
   inviteCodes: Record<string, { inviterId: string | null; uses: number }>;
   inviteOffsets: Record<string, number>;
+  inviteBonus: Record<string, number>;
   premium: Record<string, PremiumRecord>;
   giveaways: Record<string, Giveaway>;
 };
@@ -323,6 +328,7 @@ function emptyStore(): Store {
     reminders: [],
     inviteCodes: {},
     inviteOffsets: {},
+    inviteBonus: {},
     premium: {},
     giveaways: {},
   };
@@ -830,6 +836,8 @@ export async function respondToExtraCommand(
     case "greroll": return respondGiveawayReroll(message, args);
     case "glist": return respondGiveawayList(message);
     case "gdelete": return respondGiveawayDelete(message, args);
+    case "addinvites": return respondAddCount(message, args, "invites");
+    case "addmessages": return respondAddCount(message, args, "messages");
     default:
       break;
   }
@@ -907,7 +915,8 @@ function invitesTotalFor(guildId: string, userId: string) {
     }
   }
   const offset = store.inviteOffsets[`${guildId}:${userId}`] ?? 0;
-  return { total: Math.max(0, total - offset), links, raw: total };
+  const bonus = store.inviteBonus[`${guildId}:${userId}`] ?? 0;
+  return { total: Math.max(0, total - offset) + bonus, links, raw: total, bonus };
 }
 
 async function respondInvites(message: Message, args: string[]) {
@@ -918,7 +927,7 @@ async function respondInvites(message: Message, args: string[]) {
   // "uses" number, which also includes joins from BEFORE this bot was added.
   await cacheGuildInvites(guild);
 
-  const { total, links } = invitesTotalFor(guild.id, user.id);
+  const { total, links, bonus } = invitesTotalFor(guild.id, user.id);
   const stat = store.inviteStats[`${guild.id}:${user.id}`] ?? { joins: 0, leaves: 0 };
   const left = Math.min(stat.leaves, total);
   const real = Math.max(0, total - left);
@@ -926,10 +935,12 @@ async function respondInvites(message: Message, args: string[]) {
   const lines = [
     `${dot} **User :** ${user}`,
     `${dot} **Total Invites :** \`${total}\``,
+    `${dot} **Joins :** \`${total}\``,
     `${dot} **Invite Links Counted :** \`${links}\``,
+    bonus > 0 ? `${dot} **Added Manually :** \`${bonus}\`` : "",
     `${dot} **Left (since bot joined) :** \`${left}\``,
     `${dot} **Still In Server :** \`${real}\``,
-  ];
+  ].filter(Boolean);
   if (noInvitePermission.has(guild.id)) {
     lines.push(
       "",
@@ -1332,6 +1343,11 @@ async function respondReset(
     }
     if (command === "resetinvites") {
       await resetInviteOffsets(message.guild!, null);
+      for (const key of Object.keys(store.inviteBonus)) {
+        if (key.startsWith(prefix)) {
+          delete store.inviteBonus[key];
+        }
+      }
     }
     scheduleSave();
     return card(message, `Reset ${label}`, [
@@ -1343,6 +1359,7 @@ async function respondReset(
     const existed = delete bucket[`${guildId}:${targetId}`];
     if (command === "resetinvites") {
       await resetInviteOffsets(message.guild!, targetId);
+      delete store.inviteBonus[`${guildId}:${targetId}`];
     }
     scheduleSave();
     return card(message, `Reset ${label}`, [
@@ -3029,4 +3046,64 @@ async function respondGiveawayDelete(message: Message, args: string[]) {
   delete store.giveaways[found.id];
   scheduleSave();
   return card(message, "Giveaway", [`${dot} Giveaway cancelled and removed.`]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  addinvites / addmessages (manual adjustments, Manage Server)        */
+/* ------------------------------------------------------------------ */
+
+async function respondAddCount(
+  message: Message,
+  args: string[],
+  kind: "invites" | "messages",
+) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageGuild, "Manage Server"))) {
+    return;
+  }
+  const guild = message.guild!;
+  const botId = message.client.user?.id;
+  const target = message.mentions.users.find((user) => user.id !== botId);
+  const idArg = args.find((arg) => /^\d{17,20}$/.test(arg));
+  const user =
+    target ?? (idArg ? await message.client.users.fetch(idArg).catch(() => null) : null);
+  const amount = Number(args.find((arg) => /^\d{1,7}$/.test(arg)));
+
+  if (!user || user.bot || !amount || amount < 1 || amount > 1_000_000) {
+    return card(message, `Add ${kind === "invites" ? "Invites" : "Messages"}`, [
+      `Usage: \`${cmdPrefix()}add${kind} @user <amount>\` (1 - 1,000,000)`,
+    ]);
+  }
+
+  const key = `${guild.id}:${user.id}`;
+
+  if (kind === "invites") {
+    store.inviteBonus[key] = (store.inviteBonus[key] ?? 0) + amount;
+    scheduleSave();
+    await cacheGuildInvites(guild);
+    const { total } = invitesTotalFor(guild.id, user.id);
+    const left = Math.min(store.inviteStats[key]?.leaves ?? 0, total);
+    return card(message, "Add Invites", [
+      `${dot} Added \`${amount}\` invite(s) and \`${amount}\` join(s) to ${user}.`,
+      `${dot} **Total Invites :** \`${total}\``,
+      `${dot} **Joins :** \`${total}\``,
+      `${dot} **Left :** \`${left}\``,
+      `${dot} **Still In Server :** \`${Math.max(0, total - left)}\``,
+    ]);
+  }
+
+  const stat = store.messages[key] ?? { total: 0, day: todayKey(), today: 0 };
+  stat.total += amount;
+  store.messages[key] = stat;
+  scheduleSave();
+
+  const prefix = `${guild.id}:`;
+  const rank =
+    Object.entries(store.messages).filter(
+      ([entryKey, value]) => entryKey.startsWith(prefix) && value.total > stat.total,
+    ).length + 1;
+  return card(message, "Add Messages", [
+    `${dot} Added \`${amount}\` message(s) to ${user}.`,
+    `${dot} **Total Messages :** \`${stat.total}\``,
+    `${dot} **Server Rank :** \`#${rank}\``,
+  ]);
 }

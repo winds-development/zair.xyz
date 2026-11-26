@@ -561,6 +561,8 @@ function buildCategoryDetails(): Record<
       `${whiteDotEmoji} \`${cmdPrefix()}messages [@user]\` - (Message count and rank) • \`${cmdPrefix()}ms\` \`${cmdPrefix()}msgs\``,
       `${whiteDotEmoji} \`${cmdPrefix()}resetinvites @user/all\` - (Reset invites, Manage Server) • \`${cmdPrefix()}ri\``,
       `${whiteDotEmoji} \`${cmdPrefix()}resetmessages @user/all\` - (Reset message counts) • \`${cmdPrefix()}rm\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}addinvites @user <amount>\` - (Add invites + joins, Manage Server) • \`${cmdPrefix()}ai\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}addmessages @user <amount>\` - (Add to message count, Manage Server) • \`${cmdPrefix()}amsg\``,
     ],
   },
   security: {
@@ -1846,6 +1848,42 @@ function moderationCategoryComponents(
   ];
 }
 
+const categoryCommandsPerPage = 10;
+
+function paginatedCategoryComponents(
+  user: { tag?: string; username: string; id: string },
+  categoryKey: string,
+  page: number,
+): RawDiscordComponent[] {
+  const categoryDetails = buildCategoryDetails();
+  const category = categoryDetails[categoryKey] ?? categoryDetails.bot;
+  const commandLines = category.lines.filter((line) => line.trim() !== "");
+  const pages: string[][] = [];
+  for (let index = 0; index < commandLines.length; index += categoryCommandsPerPage) {
+    pages.push(commandLines.slice(index, index + categoryCommandsPerPage));
+  }
+  const safePage = Math.max(0, Math.min(page, pages.length - 1));
+  const sentAt = Math.floor(Date.now() / 1000);
+
+  return [
+    {
+      type: 17,
+      accent_color: embedColor,
+      components: [
+        textComponent(`# ${category.title.replace(" CMD", " COMMAND")} !!`),
+        separatorComponent(),
+        textComponent((pages[safePage] ?? []).join("\n")),
+        separatorComponent(),
+        paginationButtons(`category-pages-${categoryKey}`, safePage, pages.length),
+        separatorComponent(),
+        textComponent(
+          `Page : ${safePage + 1}/${pages.length} - ${botName()} | ${requesterLabel(user)} • <t:${sentAt}:F>`,
+        ),
+      ],
+    },
+  ];
+}
+
 function musicRedirectComponents(user: {
   tag?: string;
   username: string;
@@ -1886,6 +1924,12 @@ function makeCategoryResponseComponents(
 
   const categoryDetails = buildCategoryDetails();
   const category = categoryDetails[categoryKey] ?? categoryDetails.bot;
+  if (
+    category.lines.filter((line) => line.trim() !== "").length >
+    categoryCommandsPerPage
+  ) {
+    return paginatedCategoryComponents(user, categoryKey, 0);
+  }
   const sentAt = Math.floor(Date.now() / 1000);
   const title =
     categoryKey === "bot"
@@ -4785,6 +4829,28 @@ async function handleModerationCommandsButton(interaction: ButtonInteraction) {
   } as never);
 }
 
+async function handleCategoryPagesButton(interaction: ButtonInteraction) {
+  const [, scope, action, rawPage] = interaction.customId.split(":");
+  const categoryKey = (scope ?? "").replace("category-pages-", "");
+  const currentPage = Number(rawPage);
+
+  if (action === "trash") {
+    await interaction.deferUpdate();
+    await interaction.message.delete();
+    return;
+  }
+
+  if (!Number.isInteger(currentPage)) {
+    return;
+  }
+
+  const nextPage = action === "previous" ? currentPage - 1 : currentPage + 1;
+  await interaction.deferUpdate();
+  await interaction.message.edit({
+    components: paginatedCategoryComponents(interaction.user, categoryKey, nextPage),
+  } as never);
+}
+
 async function handleSecurityCategoryButton(interaction: ButtonInteraction) {
   const [, , action, rawPage] = interaction.customId.split(":");
   const currentPage = Number(rawPage);
@@ -5107,6 +5173,11 @@ export async function startRazeBot() {
         interaction.customId.startsWith("raze:help-pages:")
       ) {
         await handleHelpPagesButton(interaction);
+      } else if (
+        interaction.isButton() &&
+        interaction.customId.startsWith("raze:category-pages-")
+      ) {
+        await handleCategoryPagesButton(interaction);
       } else if (
         interaction.isButton() &&
         interaction.customId.startsWith("raze:ticket:builder:")
