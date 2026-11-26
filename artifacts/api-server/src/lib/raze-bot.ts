@@ -8,6 +8,7 @@ import {
   GatewayIntentBits,
   MessageFlags,
   ModalBuilder,
+  Partials,
   PermissionFlagsBits,
   REST,
   Routes,
@@ -549,6 +550,17 @@ function buildCategoryDetails(): Record<
       `${whiteDotEmoji} \`${cmdPrefix()}unlock [#channel]\` - (Unlock a channel) • \`${cmdPrefix()}ulk\``,
       `${whiteDotEmoji} \`${cmdPrefix()}slowmode <seconds/off>\` - (Set channel slowmode) • \`${cmdPrefix()}sm\``,
       `${whiteDotEmoji} \`${cmdPrefix()}nick @user <name/reset>\` - (Change a nickname, Manage Nicknames) • \`${cmdPrefix()}nn\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}reactionrole add <msg id> <emoji> @role\` - (Reaction role, Manage Roles) • \`${cmdPrefix()}rr\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}reactionrole remove <msg id> <emoji>\` - (Remove a reaction role)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}reactionrole list\` - (List reaction roles)`,
+      `${whiteDotEmoji} \`${cmdPrefix()}autorole add/remove @role\` - (Role given on join, add bots for bots) • \`${cmdPrefix()}aro\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}autoreact add/remove @user <emoji>\` - (React whenever someone @mentions a user) • \`${cmdPrefix()}ar\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}role add/remove @user @role\` - (Give or remove a role, Manage Roles) • \`${cmdPrefix()}r\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}hide [#channel]\` - (Hide a channel from everyone) • \`${cmdPrefix()}hd\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}unhide [#channel]\` - (Show a hidden channel again) • \`${cmdPrefix()}uhd\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}inrole @role\` - (List members who have a role) • \`${cmdPrefix()}inr\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}banlist\` - (Show banned users, Ban Members) • \`${cmdPrefix()}bl\``,
+      `${whiteDotEmoji} \`${cmdPrefix()}pin / ${cmdPrefix()}unpin\` - (Pin or unpin a replied message) • \`${cmdPrefix()}up\``,
       `${whiteDotEmoji} \`${cmdPrefix()}purge <1-100> [@user]\` - (Delete messages, Manage Messages) • \`${cmdPrefix()}clear\``,
       `${whiteDotEmoji} \`${cmdPrefix()}gstart <time> <winners> <prize>\` - (Start a giveaway, Manage Server) • \`${cmdPrefix()}gwy\``,
       `${whiteDotEmoji} \`${cmdPrefix()}gend <message id>\` - (End a giveaway now and pick winners) • \`${cmdPrefix()}ge\``,
@@ -4947,7 +4959,10 @@ export async function startRazeBot() {
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildInvites,
+      GatewayIntentBits.GuildMessageReactions,
     ],
+    // Needed so reaction roles keep working on old (uncached) messages.
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction],
   });
 
   activeClient = client;
@@ -5395,7 +5410,7 @@ export async function startRazeBot() {
   }));
 
   logger.info(
-    { tokenLength: token.length, intents: "Guilds, GuildMessages, GuildMembers, MessageContent, GuildInvites" },
+    { tokenLength: token.length, intents: "Guilds, GuildMessages, GuildMembers, MessageContent, GuildInvites, GuildMessageReactions" },
     "ZAIR connecting to the Discord gateway",
   );
   diagnostics.phase = "logging-in";

@@ -13,8 +13,12 @@ import {
   version as djsVersion,
   type Client,
   type Guild,
+  type GuildMember,
   type Invite,
   type Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type PartialUser,
   type User,
 } from "discord.js";
 import { logger } from "./logger";
@@ -147,6 +151,15 @@ const commandAliases: Record<string, string> = {
   gd: "gdelete",
   ai: "addinvites",
   amsg: "addmessages",
+  rr: "reactionrole",
+  aro: "autorole",
+  ar: "autoreact",
+  r: "role",
+  hd: "hide",
+  uhd: "unhide",
+  inr: "inrole",
+  bl: "banlist",
+  up: "unpin",
 };
 
 const extraCommandNames = new Set([
@@ -210,6 +223,16 @@ const extraCommandNames = new Set([
   "gdelete",
   "addinvites",
   "addmessages",
+  "reactionrole",
+  "autorole",
+  "autoreact",
+  "role",
+  "hide",
+  "unhide",
+  "inrole",
+  "banlist",
+  "pin",
+  "unpin",
 ]);
 
 // These work in DMs too; everything else needs a server.
@@ -305,6 +328,19 @@ type Store = {
   inviteBonus: Record<string, number>;
   premium: Record<string, PremiumRecord>;
   giveaways: Record<string, Giveaway>;
+  reactionRoles: Record<
+    string,
+    {
+      guildId: string;
+      channelId: string;
+      messageId: string;
+      emojiKey: string;
+      emojiLabel: string;
+      roleId: string;
+    }
+  >;
+  autoroles: Record<string, { humans: string[]; bots: string[] }>;
+  autoReacts: Record<string, string[]>;
 };
 
 const dataFile =
@@ -331,6 +367,9 @@ function emptyStore(): Store {
     inviteBonus: {},
     premium: {},
     giveaways: {},
+    reactionRoles: {},
+    autoroles: {},
+    autoReacts: {},
   };
 }
 
@@ -566,6 +605,9 @@ export async function initExtras(client: Client) {
   });
 
   client.on(Events.GuildMemberAdd, async (member) => {
+    if (!member.pending) {
+      void applyAutoroles(member);
+    }
     try {
       const record = await detectInviter(member.guild);
       store.inviterOf[`${member.guild.id}:${member.id}`] = record;
@@ -578,6 +620,21 @@ export async function initExtras(client: Client) {
       scheduleSave();
     } catch (error) {
       logger.warn({ err: error }, "Invite tracking failed on member join");
+    }
+  });
+
+  client.on(Events.MessageReactionAdd, (reaction, user) => {
+    void handleReactionRole(reaction, user, true);
+  });
+
+  client.on(Events.MessageReactionRemove, (reaction, user) => {
+    void handleReactionRole(reaction, user, false);
+  });
+
+  // Members who still have to accept the rules get their autoroles afterwards.
+  client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+    if (oldMember.pending && !newMember.pending) {
+      void applyAutoroles(newMember);
     }
   });
 
@@ -666,6 +723,25 @@ export async function trackMessage(message: Message) {
   }
 
   scheduleSave();
+
+  // Auto reactions: only when the user is really @mentioned in the text.
+  void (async () => {
+    for (const mentioned of message.mentions.users.values()) {
+      const emojis = store.autoReacts[`${guildId}:${mentioned.id}`];
+      if (!emojis?.length) {
+        continue;
+      }
+      if (
+        !message.content.includes(`<@${mentioned.id}>`) &&
+        !message.content.includes(`<@!${mentioned.id}>`)
+      ) {
+        continue;
+      }
+      for (const emoji of emojis) {
+        await message.react(emoji).catch(() => undefined);
+      }
+    }
+  })();
 
   if (!message.channel.isSendable()) {
     return;
@@ -838,6 +914,16 @@ export async function respondToExtraCommand(
     case "gdelete": return respondGiveawayDelete(message, args);
     case "addinvites": return respondAddCount(message, args, "invites");
     case "addmessages": return respondAddCount(message, args, "messages");
+    case "reactionrole": return respondReactionRole(message, args);
+    case "autorole": return respondAutorole(message, args);
+    case "autoreact": return respondAutoReact(message, args);
+    case "role": return respondRole(message, args);
+    case "hide": return respondHide(message, true);
+    case "unhide": return respondHide(message, false);
+    case "inrole": return respondInRole(message, args);
+    case "banlist": return respondBanList(message);
+    case "pin": return respondPin(message, args, true);
+    case "unpin": return respondPin(message, args, false);
     default:
       break;
   }
@@ -3106,4 +3192,459 @@ async function respondAddCount(
     `${dot} **Total Messages :** \`${stat.total}\``,
     `${dot} **Server Rank :** \`#${rank}\``,
   ]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Reaction roles, autorole, autoreact and extra server helpers        */
+/* ------------------------------------------------------------------ */
+
+function parseEmojiToken(tokens: string[]): string | null {
+  return (
+    tokens.find(
+      (token) =>
+        /^<a?:\w{2,32}:\d{17,20}>$/.test(token) ||
+        (!/^<[@#&]/.test(token) &&
+          !/^\d{17,20}$/.test(token) &&
+          !/^https?:/i.test(token) &&
+          token.length <= 8 &&
+          !/^[a-z]+$/i.test(token)),
+    ) ?? null
+  );
+}
+
+async function roleProblem(message: Message, role: { id: string; managed: boolean; comparePositionTo: (other: any) => number }) {
+  const guild = message.guild!;
+  const me = guild.members.me;
+  if (role.id === guild.id || role.managed) {
+    return "That role cannot be given by a bot (@everyone or an integration role).";
+  }
+  if (!me || me.roles.highest.comparePositionTo(role as never) <= 0) {
+    return "My highest role must be above that role. Drag my role higher in Server Settings -> Roles.";
+  }
+  const author = message.member;
+  if (
+    guild.ownerId !== message.author.id &&
+    (!author || author.roles.highest.comparePositionTo(role as never) <= 0)
+  ) {
+    return "You can only manage roles that are below your own highest role.";
+  }
+  return null;
+}
+
+function roleFromInput(message: Message, args: string[]) {
+  const guild = message.guild!;
+  return (
+    message.mentions.roles.first() ??
+    args
+      .map((arg) => guild.roles.cache.get(arg.replace(/\D/g, "")))
+      .find(Boolean) ??
+    null
+  );
+}
+
+async function locateMessage(message: Message, ref: string) {
+  const guild = message.guild!;
+  const link = ref.match(/channels\/\d+\/(\d+)\/(\d+)/);
+  const channelId = link ? link[1]! : message.channelId;
+  const messageId = link ? link[2]! : ref.match(/^(\d{17,20})$/)?.[1];
+  if (!messageId) {
+    return null;
+  }
+  try {
+    const channel = await guild.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased() || !("messages" in channel)) {
+      return null;
+    }
+    return await channel.messages.fetch(messageId);
+  } catch {
+    return null;
+  }
+}
+
+async function respondReactionRole(message: Message, args: string[]) {
+  const guild = message.guild!;
+  const sub = args[0]?.toLowerCase();
+
+  if (sub === "list") {
+    const prefix = guild.id;
+    const rows = Object.values(store.reactionRoles).filter((entry) => entry.guildId === prefix);
+    return card(
+      message,
+      "Reaction Roles",
+      rows.length
+        ? rows
+            .slice(0, 20)
+            .map(
+              (entry) =>
+                `${dot} ${entry.emojiLabel} -> <@&${entry.roleId}> - [jump](https://discord.com/channels/${guild.id}/${entry.channelId}/${entry.messageId})`,
+            )
+        : ["No reaction roles are set up in this server."],
+    );
+  }
+
+  if (sub !== "add" && sub !== "remove") {
+    return card(message, "Reaction Roles", [
+      `${dot} \`${cmdPrefix()}reactionrole add <message id or link> <emoji> @role\``,
+      `${dot} \`${cmdPrefix()}reactionrole remove <message id or link> <emoji>\``,
+      `${dot} \`${cmdPrefix()}reactionrole list\``,
+    ]);
+  }
+
+  if (!(await needPermission(message, PermissionFlagsBits.ManageRoles, "Manage Roles"))) {
+    return;
+  }
+
+  const rest = args.slice(1);
+  const target = rest[0] ? await locateMessage(message, rest[0]) : null;
+  const emojiInput = parseEmojiToken(rest.slice(1));
+  if (!target || !emojiInput) {
+    return card(message, "Reaction Roles", [
+      "I could not find that message or emoji. Use the message ID (in its own channel) or the message link.",
+    ]);
+  }
+
+  if (sub === "add") {
+    const role = roleFromInput(message, rest.slice(1));
+    if (!role) {
+      return card(message, "Reaction Roles", ["Mention the role to give, like `@Member`."]);
+    }
+    const problem = await roleProblem(message, role);
+    if (problem) {
+      return card(message, "Reaction Roles", [problem]);
+    }
+    let reaction;
+    try {
+      reaction = await target.react(emojiInput);
+    } catch {
+      return card(message, "Reaction Roles", [
+        "I could not react with that emoji. Use a normal emoji or one from this server, and make sure I can add reactions there.",
+      ]);
+    }
+    const emojiKey = reaction.emoji.id ?? reaction.emoji.name ?? emojiInput;
+    store.reactionRoles[`${target.id}:${emojiKey}`] = {
+      guildId: guild.id,
+      channelId: target.channelId,
+      messageId: target.id,
+      emojiKey,
+      emojiLabel: emojiInput,
+      roleId: role.id,
+    };
+    scheduleSave();
+    return card(message, "Reaction Roles", [
+      `${dot} Members who react with ${emojiInput} on [that message](${target.url}) get ${role}.`,
+      `${dot} Removing the reaction removes the role.`,
+    ]);
+  }
+
+  const emojiKey =
+    emojiInput.match(/^<a?:\w+:(\d+)>$/)?.[1] ?? emojiInput;
+  const key = `${target.id}:${emojiKey}`;
+  if (!store.reactionRoles[key]) {
+    return card(message, "Reaction Roles", ["That reaction role does not exist."]);
+  }
+  delete store.reactionRoles[key];
+  scheduleSave();
+  const existing = target.reactions.cache.find(
+    (entry) => (entry.emoji.id ?? entry.emoji.name) === emojiKey,
+  );
+  await existing?.users.remove(message.client.user?.id).catch(() => undefined);
+  return card(message, "Reaction Roles", [`${dot} Reaction role removed.`]);
+}
+
+async function handleReactionRole(
+  reaction: MessageReaction | PartialMessageReaction,
+  user: User | PartialUser,
+  add: boolean,
+) {
+  if (user.bot) {
+    return;
+  }
+  const emojiKey = reaction.emoji.id ?? reaction.emoji.name ?? "";
+  const mapping = store.reactionRoles[`${reaction.message.id}:${emojiKey}`];
+  if (!mapping) {
+    return;
+  }
+  const guild = extrasClient?.guilds.cache.get(mapping.guildId);
+  if (!guild) {
+    return;
+  }
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  if (!member) {
+    return;
+  }
+  try {
+    if (add) {
+      await member.roles.add(mapping.roleId, "Reaction role");
+    } else {
+      await member.roles.remove(mapping.roleId, "Reaction role");
+    }
+  } catch (error) {
+    logger.warn({ err: error, roleId: mapping.roleId }, "Reaction role could not be changed (check role order / permissions)");
+  }
+}
+
+async function applyAutoroles(member: GuildMember) {
+  const config = store.autoroles[member.guild.id];
+  const ids = config ? (member.user.bot ? config.bots : config.humans) : [];
+  if (ids.length === 0) {
+    return;
+  }
+  try {
+    await member.roles.add(ids, "Autorole");
+  } catch (error) {
+    logger.warn({ err: error, guildId: member.guild.id }, "Autorole could not be given (check role order / permissions)");
+  }
+}
+
+async function respondAutorole(message: Message, args: string[]) {
+  const guild = message.guild!;
+  const sub = args[0]?.toLowerCase();
+  const config = store.autoroles[guild.id] ?? { humans: [], bots: [] };
+
+  if (sub === "list" || !sub) {
+    const show = (ids: string[]) => (ids.length ? ids.map((id) => `<@&${id}>`).join(" ") : "None");
+    return card(message, "Autorole", [
+      `${dot} **Members :** ${show(config.humans)}`,
+      `${dot} **Bots :** ${show(config.bots)}`,
+      "",
+      `Usage: \`${cmdPrefix()}autorole add @role\` • \`${cmdPrefix()}autorole remove @role\` • add \`bots\` at the end for bot accounts (\`${cmdPrefix()}autorole add @Bots bots\`)`,
+    ]);
+  }
+
+  if (sub !== "add" && sub !== "remove") {
+    return card(message, "Autorole", [`Usage: \`${cmdPrefix()}autorole add @role\`, \`${cmdPrefix()}autorole remove @role\`, \`${cmdPrefix()}autorole list\``]);
+  }
+  if (!(await needPermission(message, PermissionFlagsBits.ManageRoles, "Manage Roles"))) {
+    return;
+  }
+
+  const role = roleFromInput(message, args.slice(1));
+  if (!role) {
+    return card(message, "Autorole", ["Mention the role, like `@Member`."]);
+  }
+  const forBots = args.slice(1).some((arg) => ["bot", "bots"].includes(arg.toLowerCase()));
+  const list = forBots ? config.bots : config.humans;
+
+  if (sub === "add") {
+    const problem = await roleProblem(message, role);
+    if (problem) {
+      return card(message, "Autorole", [problem]);
+    }
+    if (list.includes(role.id)) {
+      return card(message, "Autorole", ["That role is already an autorole."]);
+    }
+    if (list.length >= 5) {
+      return card(message, "Autorole", ["You can have at most 5 autoroles per group."]);
+    }
+    list.push(role.id);
+  } else {
+    const index = list.indexOf(role.id);
+    if (index === -1) {
+      return card(message, "Autorole", ["That role is not an autorole."]);
+    }
+    list.splice(index, 1);
+  }
+
+  store.autoroles[guild.id] = config;
+  scheduleSave();
+  return card(message, "Autorole", [
+    sub === "add"
+      ? `${dot} New ${forBots ? "bots" : "members"} will now get ${role} when they join.`
+      : `${dot} ${role} was removed from the ${forBots ? "bot" : "member"} autoroles.`,
+  ]);
+}
+
+async function respondAutoReact(message: Message, args: string[]) {
+  const guild = message.guild!;
+  const sub = args[0]?.toLowerCase();
+
+  if (sub === "list" || !sub) {
+    const prefix = `${guild.id}:`;
+    const rows = Object.entries(store.autoReacts).filter(([key]) => key.startsWith(prefix));
+    return card(
+      message,
+      "Auto React",
+      rows.length
+        ? [
+            ...rows.map(([key, emojis]) => `${dot} <@${key.slice(prefix.length)}> -> ${emojis.join(" ")}`),
+            "",
+            "-# I react whenever someone @mentions them (replies without an @mention do not count).",
+          ]
+        : [
+            "No auto reactions are set.",
+            `Usage: \`${cmdPrefix()}autoreact add @user <emoji>\` • \`${cmdPrefix()}autoreact remove @user [emoji]\``,
+          ],
+    );
+  }
+
+  if (sub !== "add" && sub !== "remove") {
+    return card(message, "Auto React", [`Usage: \`${cmdPrefix()}autoreact add @user <emoji>\`, \`${cmdPrefix()}autoreact remove @user [emoji]\`, \`${cmdPrefix()}autoreact list\``]);
+  }
+  if (!(await needPermission(message, PermissionFlagsBits.ManageGuild, "Manage Server"))) {
+    return;
+  }
+
+  const botId = message.client.user?.id;
+  const user = message.mentions.users.find((entry) => entry.id !== botId);
+  if (!user) {
+    return card(message, "Auto React", [`Mention the user, like \`${cmdPrefix()}autoreact add @user 🔥\``]);
+  }
+  const key = `${guild.id}:${user.id}`;
+  const emoji = parseEmojiToken(args.slice(1));
+
+  if (sub === "add") {
+    if (!emoji) {
+      return card(message, "Auto React", [`Add an emoji after the user, like \`${cmdPrefix()}autoreact add @user 🔥\``]);
+    }
+    try {
+      const test = await message.react(emoji);
+      await test.users.remove(botId).catch(() => undefined);
+    } catch {
+      return card(message, "Auto React", ["I cannot use that emoji. Use a normal emoji or one from a server I am in."]);
+    }
+    const list = store.autoReacts[key] ?? [];
+    if (list.includes(emoji)) {
+      return card(message, "Auto React", ["That emoji is already set for this user."]);
+    }
+    if (list.length >= 3) {
+      return card(message, "Auto React", ["At most 3 emojis per user."]);
+    }
+    list.push(emoji);
+    store.autoReacts[key] = list;
+    scheduleSave();
+    return card(message, "Auto React", [`${dot} I will react ${emoji} whenever someone @mentions ${user}.`]);
+  }
+
+  const list = store.autoReacts[key] ?? [];
+  const remaining = emoji ? list.filter((entry) => entry !== emoji) : [];
+  if (remaining.length === list.length) {
+    return card(message, "Auto React", ["Nothing to remove for that user."]);
+  }
+  if (remaining.length) {
+    store.autoReacts[key] = remaining;
+  } else {
+    delete store.autoReacts[key];
+  }
+  scheduleSave();
+  return card(message, "Auto React", [`${dot} Auto reaction removed for ${user}.`]);
+}
+
+async function respondRole(message: Message, args: string[]) {
+  const sub = args[0]?.toLowerCase();
+  if ((sub !== "add" && sub !== "remove") || !(await needPermission(message, PermissionFlagsBits.ManageRoles, "Manage Roles"))) {
+    if (sub !== "add" && sub !== "remove") {
+      return card(message, "Role", [`Usage: \`${cmdPrefix()}role add @user @role\` or \`${cmdPrefix()}role remove @user @role\``]);
+    }
+    return;
+  }
+  const botId = message.client.user?.id;
+  const user = message.mentions.users.find((entry) => entry.id !== botId);
+  const role = roleFromInput(message, args.slice(1));
+  const member = user ? await resolveMember(message, user) : null;
+  if (!member || !role) {
+    return card(message, "Role", [`Usage: \`${cmdPrefix()}role add @user @role\` or \`${cmdPrefix()}role remove @user @role\``]);
+  }
+  const problem = await roleProblem(message, role);
+  if (problem) {
+    return card(message, "Role", [problem]);
+  }
+  try {
+    if (sub === "add") {
+      await member.roles.add(role, `Role added by ${message.author.tag}`);
+    } else {
+      await member.roles.remove(role, `Role removed by ${message.author.tag}`);
+    }
+  } catch {
+    return card(message, "Role", ["I could not change that role (check my permissions and role order)."]);
+  }
+  return card(message, "Role", [
+    `${dot} ${sub === "add" ? "Gave" : "Removed"} ${role} ${sub === "add" ? "to" : "from"} ${member}.`,
+  ]);
+}
+
+async function respondHide(message: Message, hide: boolean) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageChannels, "Manage Channels"))) {
+    return;
+  }
+  const channel = message.mentions.channels.first() ?? message.channel;
+  if (!("permissionOverwrites" in channel)) {
+    return card(message, "Hide", ["I can only change server channels."]);
+  }
+  try {
+    await channel.permissionOverwrites.edit(
+      message.guild!.roles.everyone,
+      { ViewChannel: hide ? false : null },
+      { reason: `${hide ? "Hidden" : "Unhidden"} by ${message.author.tag}` },
+    );
+  } catch {
+    return card(message, hide ? "Hide" : "Unhide", ["I could not change that channel (missing permission)."]);
+  }
+  return card(message, hide ? "Channel Hidden" : "Channel Visible", [
+    `${dot} <#${channel.id}> is now ${hide ? "**hidden** from @everyone" : "**visible** to @everyone again"}.`,
+  ]);
+}
+
+async function respondInRole(message: Message, args: string[]) {
+  const guild = message.guild!;
+  const role = roleFromInput(message, args);
+  if (!role) {
+    return card(message, "In Role", [`Usage: \`${cmdPrefix()}inrole @role\``]);
+  }
+  if (guild.memberCount <= 2000) {
+    await guild.members.fetch().catch(() => undefined);
+  }
+  const members = [...role.members.values()];
+  return card(message, "In Role", [
+    `${dot} **Role :** ${role}`,
+    `${dot} **Members :** \`${members.length}\``,
+    members.length ? members.slice(0, 30).map((member) => `${member}`).join(" ") : "Nobody has this role.",
+    members.length > 30 ? `...and ${members.length - 30} more` : "",
+  ].filter(Boolean));
+}
+
+async function respondBanList(message: Message) {
+  if (!(await needPermission(message, PermissionFlagsBits.BanMembers, "Ban Members"))) {
+    return;
+  }
+  try {
+    const bans = await message.guild!.bans.fetch({ limit: 20 });
+    return card(
+      message,
+      "Ban List",
+      bans.size
+        ? [
+            ...bans.map(
+              (ban) =>
+                `${dot} **${cleanText(ban.user.username, 32)}** (\`${ban.user.id}\`) - ${cleanText(ban.reason ?? "No reason", 60)}`,
+            ),
+            bans.size === 20 ? "-# Showing the first 20 bans." : "",
+          ].filter(Boolean)
+        : ["Nobody is banned in this server."],
+    );
+  } catch {
+    return card(message, "Ban List", ["I need the **Ban Members** permission to read the ban list."]);
+  }
+}
+
+async function respondPin(message: Message, args: string[], pin: boolean) {
+  if (!(await needPermission(message, PermissionFlagsBits.ManageMessages, "Manage Messages"))) {
+    return;
+  }
+  const targetId = message.reference?.messageId ?? args.find((arg) => /^\d{17,20}$/.test(arg));
+  const target = targetId ? await message.channel.messages.fetch(targetId).catch(() => null) : null;
+  if (!target) {
+    return card(message, pin ? "Pin" : "Unpin", [
+      `Reply to a message with \`${cmdPrefix()}${pin ? "pin" : "unpin"}\` or give its message ID.`,
+    ]);
+  }
+  try {
+    if (pin) {
+      await target.pin();
+    } else {
+      await target.unpin();
+    }
+  } catch {
+    return card(message, pin ? "Pin" : "Unpin", ["I could not do that (missing permission, or the channel already has 50 pins)."]);
+  }
+  return card(message, pin ? "Pinned" : "Unpinned", [`${dot} [That message](${target.url}) was ${pin ? "pinned" : "unpinned"}.`]);
 }
