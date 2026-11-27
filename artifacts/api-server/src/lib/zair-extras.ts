@@ -2262,7 +2262,13 @@ const languageNames: Record<string, string> = {
 };
 
 async function fetchJson(url: string) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(10_000),
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; ZAIR-Discord-Bot/1.0)",
+      Accept: "application/json",
+    },
+  });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
@@ -2648,9 +2654,10 @@ async function respondPurge(message: Message, args: string[]) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Crypto rate and exchange                                            */
+/*  Crypto rate and exchange (several free providers, automatic fallback) */
 /* ------------------------------------------------------------------ */
 
+// Symbols we treat as crypto (never as a fiat currency code).
 const cryptoIds: Record<string, string> = {
   btc: "bitcoin", ltc: "litecoin", eth: "ethereum", etc: "ethereum-classic",
   usdt: "tether", usdc: "usd-coin", bnb: "binancecoin", sol: "solana",
@@ -2661,56 +2668,176 @@ const cryptoIds: Record<string, string> = {
   atom: "cosmos", xlm: "stellar", sui: "sui", apt: "aptos",
 };
 
-const resolvedCoins = new Map<string, string | null>();
-const priceCache = new Map<string, { at: number; data: Record<string, any> }>();
+type CoinQuote = {
+  usd: number;
+  inr?: number;
+  eur?: number;
+  gbp?: number;
+  change?: number | null;
+};
+
+const quoteCache = new Map<string, { at: number; quotes: Record<string, CoinQuote> }>();
 let fiatCache: { at: number; rates: Record<string, number> } | null = null;
 
-async function resolveCoin(symbol: string): Promise<string | null> {
-  const key = symbol.toLowerCase();
-  if (cryptoIds[key]) {
-    return cryptoIds[key]!;
-  }
-  if (resolvedCoins.has(key)) {
-    return resolvedCoins.get(key) ?? null;
-  }
-  try {
-    const data = await fetchJson(
-      `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(key)}`,
-    );
-    const coin = (data["coins"] as any[] | undefined)?.find(
-      (entry) => String(entry.symbol).toLowerCase() === key,
-    );
-    resolvedCoins.set(key, coin?.id ?? null);
-    return coin?.id ?? null;
-  } catch {
-    return null;
-  }
+function num(value: unknown): number | undefined {
+  const parsed = typeof value === "string" ? Number(value) : (value as number);
+  return typeof parsed === "number" && Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-async function cryptoPrices(ids: string[]) {
-  const key = [...ids].sort().join(",");
-  const cached = priceCache.get(key);
+async function cryptoQuotes(symbols: string[]) {
+  const wanted = [...new Set(symbols.map((symbol) => symbol.toUpperCase()))];
+  const cacheKey = [...wanted].sort().join(",");
+  const cached = quoteCache.get(cacheKey);
   if (cached && Date.now() - cached.at < 30_000) {
-    return cached.data;
+    return { quotes: cached.quotes, errors: [] as string[] };
   }
-  const data = await fetchJson(
-    `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(key)}&vs_currencies=usd,inr,eur,gbp&include_24hr_change=true`,
-  );
-  priceCache.set(key, { at: Date.now(), data });
-  return data;
+
+  const quotes: Record<string, CoinQuote> = {};
+  const errors: string[] = [];
+  const missing = () => wanted.filter((symbol) => !quotes[symbol]);
+
+  const providers: Array<[string, () => Promise<void>]> = [
+    [
+      "cryptocompare",
+      async () => {
+        const data = await fetchJson(
+          `https://min-api.cryptocompare.com/data/pricemultifull?fsyms=${missing().join(",")}&tsyms=USD,INR,EUR,GBP`,
+        );
+        for (const symbol of missing()) {
+          const raw = data["RAW"]?.[symbol];
+          const usd = num(raw?.["USD"]?.["PRICE"]);
+          if (usd) {
+            quotes[symbol] = {
+              usd,
+              inr: num(raw?.["INR"]?.["PRICE"]),
+              eur: num(raw?.["EUR"]?.["PRICE"]),
+              gbp: num(raw?.["GBP"]?.["PRICE"]),
+              change:
+                typeof raw?.["USD"]?.["CHANGEPCT24HOUR"] === "number"
+                  ? raw["USD"]["CHANGEPCT24HOUR"]
+                  : null,
+            };
+          }
+        }
+      },
+    ],
+    [
+      "coinbase",
+      async () => {
+        await Promise.all(
+          missing().map(async (symbol) => {
+            const data = await fetchJson(
+              `https://api.coinbase.com/v2/exchange-rates?currency=${encodeURIComponent(symbol)}`,
+            );
+            const rates = data["data"]?.["rates"];
+            const usd = num(rates?.["USD"]);
+            if (usd) {
+              quotes[symbol] = {
+                usd,
+                inr: num(rates?.["INR"]),
+                eur: num(rates?.["EUR"]),
+                gbp: num(rates?.["GBP"]),
+                change: null,
+              };
+            }
+          }),
+        );
+      },
+    ],
+    [
+      "coingecko",
+      async () => {
+        const pairs: Array<[string, string]> = [];
+        for (const symbol of missing()) {
+          const id = cryptoIds[symbol.toLowerCase()];
+          if (id) {
+            pairs.push([symbol, id]);
+          }
+        }
+        if (pairs.length === 0) {
+          return;
+        }
+        const data = await fetchJson(
+          `https://api.coingecko.com/api/v3/simple/price?ids=${pairs.map(([, id]) => id).join(",")}&vs_currencies=usd,inr,eur,gbp&include_24hr_change=true`,
+        );
+        for (const [symbol, id] of pairs) {
+          const usd = num(data[id]?.["usd"]);
+          if (usd) {
+            quotes[symbol] = {
+              usd,
+              inr: num(data[id]?.["inr"]),
+              eur: num(data[id]?.["eur"]),
+              gbp: num(data[id]?.["gbp"]),
+              change: typeof data[id]?.["usd_24h_change"] === "number" ? data[id]["usd_24h_change"] : null,
+            };
+          }
+        }
+      },
+    ],
+  ];
+
+  for (const [name, run] of providers) {
+    if (missing().length === 0) {
+      break;
+    }
+    try {
+      await run();
+    } catch (error) {
+      errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (Object.keys(quotes).length > 0) {
+    quoteCache.set(cacheKey, { at: Date.now(), quotes });
+  } else if (errors.length > 0) {
+    logger.warn({ errors, symbols: wanted }, "Crypto price lookup failed on every provider");
+  }
+  return { quotes, errors };
 }
 
 async function fiatRates() {
   if (fiatCache && Date.now() - fiatCache.at < 10 * 60_000) {
     return fiatCache.rates;
   }
-  const data = await fetchJson("https://open.er-api.com/v6/latest/USD");
-  const rates = data["rates"] as Record<string, number> | undefined;
-  if (!rates) {
-    throw new Error("no fiat rates");
+  const errors: string[] = [];
+  const providers: Array<[string, () => Promise<Record<string, number> | undefined>]> = [
+    [
+      "er-api",
+      async () => (await fetchJson("https://open.er-api.com/v6/latest/USD"))["rates"],
+    ],
+    [
+      "frankfurter",
+      async () => {
+        const data = await fetchJson("https://api.frankfurter.app/latest?from=USD");
+        return data["rates"] ? { USD: 1, ...data["rates"] } : undefined;
+      },
+    ],
+    [
+      "currency-api",
+      async () => {
+        const data = await fetchJson(
+          "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
+        );
+        const usd = data["usd"] as Record<string, number> | undefined;
+        return usd
+          ? Object.fromEntries(Object.entries(usd).map(([code, value]) => [code.toUpperCase(), value]))
+          : undefined;
+      },
+    ],
+  ];
+  for (const [name, run] of providers) {
+    try {
+      const rates = await run();
+      if (rates && Object.keys(rates).length > 5) {
+        fiatCache = { at: Date.now(), rates };
+        return rates;
+      }
+    } catch (error) {
+      errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
-  fiatCache = { at: Date.now(), rates };
-  return rates;
+  logger.warn({ errors }, "Currency rate lookup failed on every provider");
+  throw new Error(errors.join(", ") || "no fiat rates");
 }
 
 function fmtPrice(value: number) {
@@ -2724,56 +2851,68 @@ function fmtPrice(value: number) {
 }
 
 async function respondRate(message: Message, args: string[]) {
-  const symbols = [...new Set(args.map((arg) => arg.toLowerCase().replace(/[^a-z0-9]/g, "")).filter(Boolean))].slice(0, 5);
-  const wanted = symbols.length ? symbols : ["btc", "eth", "ltc"];
+  const symbols = [
+    ...new Set(
+      args
+        .map((arg) => arg.toUpperCase().replace(/[^A-Z0-9]/g, ""))
+        .filter(Boolean),
+    ),
+  ].slice(0, 5);
+  const wanted = symbols.length ? symbols : ["BTC", "ETH", "LTC"];
 
-  try {
-    const resolved = await Promise.all(wanted.map(async (symbol) => ({ symbol, id: await resolveCoin(symbol) })));
-    const known = resolved.filter((entry): entry is { symbol: string; id: string } => Boolean(entry.id));
-    const unknown = resolved.filter((entry) => !entry.id).map((entry) => entry.symbol.toUpperCase());
-    if (known.length === 0) {
-      return card(message, "Crypto Rate", [
-        `I could not find: ${unknown.join(", ")}`,
-        `Usage: \`${cmdPrefix()}rate btc\` or \`${cmdPrefix()}rate ltc eth btc\` (up to 5 coins)`,
-      ]);
-    }
+  const { quotes, errors } = await cryptoQuotes(wanted);
+  const found = wanted.filter((symbol) => quotes[symbol]);
 
-    const prices = await cryptoPrices(known.map((entry) => entry.id));
-    const lines: string[] = [];
-    for (const entry of known) {
-      const price = prices[entry.id];
-      if (!price) {
-        continue;
-      }
-      const change = typeof price["usd_24h_change"] === "number" ? price["usd_24h_change"] : null;
-      const arrow = change === null ? "" : change >= 0 ? "📈" : "📉";
-      lines.push(
-        `${dot} **${entry.symbol.toUpperCase()}** - $${fmtPrice(price["usd"])} • ₹${fmtPrice(price["inr"])} • €${fmtPrice(price["eur"])} • £${fmtPrice(price["gbp"])}${change === null ? "" : ` ${arrow} \`${change >= 0 ? "+" : ""}${change.toFixed(2)}%\` (24h)`}`,
-      );
-    }
-    if (unknown.length) {
-      lines.push("", `Not found: ${unknown.join(", ")}`);
-    }
-    lines.push("", `-# Prices from CoinGecko. Use \`${cmdPrefix()}exchange 1 ltc inr\` to convert.`);
-    return card(message, "Crypto Rate", lines);
-  } catch {
-    return card(message, "Crypto Rate", ["I could not fetch prices right now. Please try again in a minute."]);
+  if (found.length === 0) {
+    return card(
+      message,
+      "Crypto Rate",
+      errors.length
+        ? [
+            "I could not fetch prices right now. Please try again in a minute.",
+            `-# ${cleanText(errors.join(" | "), 300)}`,
+          ]
+        : [
+            `I could not find: ${wanted.join(", ")}`,
+            `Usage: \`${cmdPrefix()}rate btc\` or \`${cmdPrefix()}rate ltc eth btc\` (up to 5 coins)`,
+          ],
+    );
   }
+
+  const lines = found.map((symbol) => {
+    const quote = quotes[symbol]!;
+    const parts = [`$${fmtPrice(quote.usd)}`];
+    if (quote.inr) parts.push(`₹${fmtPrice(quote.inr)}`);
+    if (quote.eur) parts.push(`€${fmtPrice(quote.eur)}`);
+    if (quote.gbp) parts.push(`£${fmtPrice(quote.gbp)}`);
+    const change =
+      typeof quote.change === "number"
+        ? ` ${quote.change >= 0 ? "📈" : "📉"} \`${quote.change >= 0 ? "+" : ""}${quote.change.toFixed(2)}%\` (24h)`
+        : "";
+    return `${dot} **${symbol}** - ${parts.join(" • ")}${change}`;
+  });
+  const notFound = wanted.filter((symbol) => !quotes[symbol]);
+  if (notFound.length) {
+    lines.push("", `Not found: ${notFound.join(", ")}`);
+  }
+  lines.push("", `-# Live prices. Use \`${cmdPrefix()}exchange 1 ltc inr\` to convert.`);
+  return card(message, "Crypto Rate", lines);
 }
 
-async function usdValueOf(symbol: string): Promise<{ usd: number; crypto: boolean } | null> {
+async function usdValueOf(
+  symbol: string,
+): Promise<{ usd: number; crypto: boolean } | null> {
   const key = symbol.toLowerCase();
-  const rates = await fiatRates();
-  if (!cryptoIds[key] && rates[key.toUpperCase()]) {
-    return { usd: 1 / rates[key.toUpperCase()]!, crypto: false };
+  if (!cryptoIds[key]) {
+    const rates = await fiatRates().catch(() => null);
+    const rate = rates?.[key.toUpperCase()];
+    if (rate) {
+      return { usd: 1 / rate, crypto: false };
+    }
   }
-  const id = await resolveCoin(key);
-  if (!id) {
-    return null;
-  }
-  const prices = await cryptoPrices([id]);
-  const usd = prices[id]?.["usd"];
-  return typeof usd === "number" ? { usd, crypto: true } : null;
+  const { quotes } = await cryptoQuotes([key]);
+  const quote = quotes[key.toUpperCase()];
+  return quote ? { usd: quote.usd, crypto: true } : null;
 }
 
 async function respondExchange(message: Message, args: string[]) {
@@ -2806,10 +2945,13 @@ async function respondExchange(message: Message, args: string[]) {
       `${dot} **${show(amount, from.crypto)} ${fromSymbol.toUpperCase()}** = **${show(result, to.crypto)} ${toSymbol.toUpperCase()}**`,
       `${dot} **1 ${fromSymbol.toUpperCase()} :** \`${show(unit, to.crypto)} ${toSymbol.toUpperCase()}\``,
       "",
-      "-# Crypto prices from CoinGecko, currency rates from ExchangeRate-API. Rates change constantly.",
+      "-# Live rates. They change constantly.",
     ]);
-  } catch {
-    return card(message, "Exchange", ["I could not fetch rates right now. Please try again in a minute."]);
+  } catch (error) {
+    return card(message, "Exchange", [
+      "I could not fetch rates right now. Please try again in a minute.",
+      `-# ${cleanText(error instanceof Error ? error.message : String(error), 250)}`,
+    ]);
   }
 }
 
